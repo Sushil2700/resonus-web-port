@@ -1,0 +1,103 @@
+{
+  "name": "resonus",
+  "main": "index.js",
+  "version": "1.0.0",
+  "license": "GPL-3.0-or-later",
+  "dependencies": {
+    "@expo/vector-icons": "^15.1.1",
+    "@react-native-community/datetimepicker": "9.1.0",
+    "@react-native-community/slider": "5.2.0",
+    "@react-native-masked-view/masked-view": "0.3.2",
+    "@tanstack/react-query": "^5.101.1",
+    "blueimp-md5": "^2.19.0",
+    "expo": "~57.0.15",
+    "expo-asset": "~57.0.13",
+    "expo-audio": "~57.0.4",
+    "expo-blur": "~57.0.3",
+    "expo-build-properties": "~57.0.13",
+    "expo-constants": "~57.0.13",
+    "expo-crypto": "~57.0.1",
+    "expo-document-picker": "~57.0.1",
+    "expo-file-system": "~57.0.5",
+    "expo-font": "~57.0.1",
+    "expo-haptics": "~57.0.1",
+    "expo-image": "~57.0.3",
+    "expo-image-manipulator": "~57.0.21",
+    "expo-image-picker": "~57.0.12",
+    "expo-linear-gradient": "~57.0.1",
+    "expo-linking": "~57.0.7",
+    "expo-media-library": "~57.0.4",
+    "expo-navigation-bar": "~57.0.2",
+    "expo-network": "~57.0.1",
+    "expo-router": "~57.0.15",
+    "expo-secure-store": "~57.0.1",
+    "expo-sharing": "~57.0.14",
+    "expo-splash-screen": "~57.0.7",
+    "expo-sqlite": "~57.0.1",
+    "expo-status-bar": "~57.0.1",
+    "expo-system-ui": "~57.0.2",
+    "expo-video": "~57.0.5",
+    "expo-web-browser": "~57.0.2",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-freeze": "^1.0.4",
+    "react-native": "0.86.2",
+    "react-native-gesture-handler": "~2.32.0",
+    "react-native-image-colors": "^2.6.0",
+    "react-native-reanimated": "4.5.1",
+    "react-native-reorderable-list": "^0.18.0",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "4.26.2",
+    "react-native-web": "~0.21.0",
+    "react-native-worklets": "0.10.1",
+    "reanimated-color-picker": "5.1.3",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@types/blueimp-md5": "^2.18.2",
+    "@types/react": "~19.2.2",
+    "eslint": "^9.39.4",
+    "eslint-config-expo": "~57.0.1",
+    "playwright": "^1.65.0",
+    "typescript": "~6.0.3"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web",
+    "lint": "expo lint",
+    "typecheck": "tsc --noEmit",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test --import ./scripts/ts-register.mjs \"test/**/*.test.ts\" && node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/ts-register.mjs scripts/canonical-id-check.mjs",
+    "canonical:check": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/ts-register.mjs scripts/canonical-id-check.mjs",
+    "icons": "node scripts/icons.mjs",
+    "i18n:status": "node scripts/i18n-status.mjs",
+    "i18n:scaffold": "node scripts/i18n-scaffold.mjs",
+    "i18n:merge": "node scripts/i18n-merge.mjs",
+    "i18n:docs": "node scripts/i18n-docs.mjs",
+    "i18n:check": "node scripts/i18n-check.mjs",
+    "i18n:rename": "node scripts/i18n-rename.mjs",
+    "settings:index": "node scripts/settings-index.mjs",
+    "fastlane:changelog": "node scripts/fastlane-changelog.mjs",
+    "harness:extractor": "bash scripts/native-harness/run.sh",
+    "postinstall": "node scripts/apply-web-patches.cjs",
+    "build:web": "expo export --platform web && node scripts/web-shell.cjs"
+  },
+  "private": true,
+  "expo": {
+    "autolinking": {
+      "exclude": [
+        "@expo/dom-webview"
+      ],
+      "buildFromSource": [
+        "expo-audio",
+        "expo-network"
+      ],
+      "android": {
+        "buildFromSource": [
+          ".*"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,121 @@
+{
+  "expo": {
+    "name": "Resonus",
+    "slug": "resonus",
+    "version": "0.8.7",
+    "orientation": "default",
+    "icon": "./assets/images/icon.png",
+    "scheme": "resonus",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "com.juananzzz.resonus",
+      "supportsTablet": true,
+      "icon": "./assets/images/resonus-ios.icon",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "audio",
+          "fetch"
+        ],
+        "BGTaskSchedulerPermittedIdentifiers": [
+          "com.juananzzz.resonus.pendingPressRefresh"
+        ]
+      }
+    },
+    "android": {
+      "package": "com.juananzzz.resonus",
+      "versionCode": 64,
+      "adaptiveIcon": {
+        "backgroundColor": "#1CD667",
+        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "intentFilters": [
+        {
+          "action": "MAIN",
+          "category": [
+            "APP_MUSIC",
+            "DEFAULT"
+          ]
+        }
+      ],
+      "permissions": [
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+      ]
+    },
+    "web": {
+      "output": "single",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "./plugins/withReleaseSigning",
+      "./plugins/withAbiVersionCode",
+      "./plugins/withGradleMemory",
+      "./plugins/withoutFontWeightAdjustment",
+      "./plugins/withTrimmedPermissions",
+      "./plugins/withAppLocales",
+      "./plugins/withoutUserScriptSandboxing",
+      "./plugins/withFixedSeekBar",
+      "./plugins/withResonusWidget",
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#141619",
+          "image": "./assets/images/splash-blank.png",
+          "imageWidth": 1,
+          "android": {
+            "backgroundColor": "#141619",
+            "image": "./assets/images/splash-blank.png",
+            "imageWidth": 1
+          }
+        }
+      ],
+      "expo-secure-store",
+      "expo-font",
+      "expo-image",
+      "expo-web-browser",
+      [
+        "expo-media-library",
+        {
+          "isAccessMediaLocationEnabled": false,
+          "granularPermissions": [
+            "audio"
+          ]
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "recordAudioAndroid": false,
+          "microphonePermission": false,
+          "enableBackgroundPlayback": true
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true,
+            "enableProguardInReleaseBuilds": true,
+            "enableShrinkResourcesInReleaseBuilds": true
+          }
+        }
+      ],
+      "expo-asset",
+      "expo-sqlite",
+      "@react-native-community/datetimepicker",
+      "expo-sharing",
+      "expo-status-bar"
+    ],
+    "experiments": {
+      "typedRoutes": false,
+      "reactCompiler": false
+    },
+    "extra": {
+      "router": {}
+    }
+  }
+}

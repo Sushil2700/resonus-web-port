@@ -1,0 +1,5247 @@
+/**
+ * Playback state and control over expo-audio.
+ *
+ * The queue lives here, in JS. Two `AudioPlayer` instances alternate: the
+ * active one plays and owns the notification, the other is the reserve a
+ * crossfade starts the next track on.
+ *
+ * Auto-advance has three paths and each leaves the others nothing to do:
+ * gapless (queued in the player, reported by `trackTransition`), crossfade (on
+ * the reserve player), and `didJustFinish` when neither applies.
+ *
+ * One MediaSession on purpose: Android Auto needs it (see `modules/car-auto`),
+ * and it uses its own `JsProxyPlayer`, not this player.
+ */
+import { artworkNetworkAllowed } from '@/lib/artworkMotionPolicy';
+import {
+  AudioModule,
+  createAudioPlayer,
+  setAudioModeAsync,
+  type AudioMetadata,
+  type AudioPlayer,
+  type AudioSource,
+  type AudioStatus,
+  type NativeAudioModule,
+} from 'expo-audio';
+import { fetch as expoFetch } from 'expo/fetch';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Network from 'expo-network';
+import { AppState, Platform } from 'react-native';
+import { create } from 'zustand';
+
+import {
+  getAlbum,
+  getArtist,
+  getArtistInfo,
+  getPlayQueue,
+  getSimilarSongs,
+  getTopSongs,
+  reportPlayback,
+  savePlayQueue,
+  scrobble,
+  streamUrl,
+  SubsonicRequestError,
+  supportsPlaybackReport,
+  supportsTranscodeOffset,
+  type Album,
+  type PlaybackState,
+  type Song,
+  type SubsonicAuth,
+} from '@/api/backend';
+import { CLIENT_NAME, streamReachable } from '@/api/subsonic';
+// The data layer's, not the backend's: `getRandomSongs` honours the library
+// filter and asks each library for its share (the rest of the mix cannot be
+// filtered, see `radioCandidates`), and `coverArtUrl` hands back the file on
+// disk when the album is downloaded instead of an address on the server.
+import { CACHED_COVER, COVER, coverArtUrl, getRandomSongs } from '@/api/data';
+import { prefetchLyrics } from '@/hooks/useLyrics';
+import {
+  animatedArtworkKey,
+  fetchAnimatedArtwork,
+  prefetchAnimatedArtwork,
+  setAnimatedArtworkFetch,
+} from '@/lib/animatedArtwork';
+import { tg } from '@/i18n';
+import { transcodeTarget } from '@/lib/audioQuality';
+import { episodePlayed, episodeResumeAt } from '@/lib/episodeResume';
+import { hashKey } from '@/lib/localLibrary';
+import { getEpisodeProgress, saveEpisodeProgress } from '@/lib/podcastDb';
+import { holdSpeculation, releaseSpeculation, speculationOpen } from '@/lib/speculation';
+import { favoriteLabel, favoriteState, onFavoritesChange, toggleFavorite } from '@/lib/remoteFavorite';
+import type { Remap } from '@/lib/navidromeRemap';
+import { remapSong } from '@/lib/navidromeRemap';
+import { noteOwnReport } from '@/lib/ownReports';
+import { beat, bump, note, timed } from '@/lib/perfLog';
+import { queryClient } from '@/lib/query';
+import {
+  appendEnd,
+  dealt,
+  insertNext,
+  moveIn,
+  nextPlayable,
+  queuedAfterMove,
+  queueKeyFor,
+  removeFrom,
+  restoreRemoved,
+  shuffleOn,
+  unshuffled,
+  type RepeatMode,
+} from '@/lib/queue';
+import { moreRadioTracks } from '@/lib/radioBuild';
+import { getItem, setItem } from '@/lib/storage';
+import { readWebVolume, saveWebVolume } from '@/lib/webVolume';
+import { profileScopeId, useAuthStore } from './auth';
+import { checkAutoUrlNow } from './autoUrl';
+import { castSetState, castSetVolumeLevel, castUpdate, initCastMedia } from './castMedia';
+import { useDownloads } from './downloads';
+import { useEqualizer } from './equalizer';
+import {
+  initJukebox,
+  isJukeboxActive,
+  jukeboxDisconnect,
+  jukeboxLoad,
+  jukeboxPause,
+  jukeboxPlay,
+  jukeboxSeek,
+  jukeboxSetVolume,
+  jukeboxSyncUpcoming,
+} from './jukebox';
+import { useLastPlayed } from './lastPlayed';
+import { offLocalNetwork, useNetworkType } from './networkType';
+import { useOfflineQueue } from './offlineQueue';
+import { usePlayCounts } from './playCounts';
+import { usePlayHistory } from './playHistory';
+import { activeArtworkEndpoint, scrobbleThresholdSec, useSettings, type TranscodeFormat } from './settings';
+import { cachedUri, useSongCache } from './songCache';
+import { useToast } from './toast';
+import {
+  initUpnp,
+  isUpnpConnected,
+  upnpDisconnect,
+  upnpPause,
+  upnpPlay,
+  upnpSeek,
+  upnpSetCrossfade,
+  upnpSetSleepTimer,
+  upnpSetVolume,
+  useUpnp,
+  type RemoteEvents,
+} from './upnp';
+import {
+  loadUpnpRemoteTrack,
+  resetUpnpRemoteSyncState,
+  syncUpnpRemoteQueue,
+} from './upnpRemoteSync';
+
+export type { RepeatMode };
+
+/**
+ * Sentinel for origins that must be translated on the fly (they are not real
+ * album/playlist names). The player header resolves them with i18n.
+ */
+export const SOURCE_FAVORITES = '@@favorites';
+export const SOURCE_HISTORY = '@@history';
+
+let sleepTimeout: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Expiry of the sleep timer, or null. In the store because the screen says how
+ * much is left, and because `onStatus` checks it: Android freezes JS timers
+ * with the screen off, which is exactly when a sleep timer runs.
+ */
+function sleepDeadline(): number | null {
+  return usePlayerStore.getState().sleepEndsAt;
+}
+
+// ── Sleep timer fade-out ────────────────────────────────────────────────────
+// The only moment this timer exists is while you are
+// falling asleep, and cutting the music abruptly right then can wake you up — the
+// opposite of what was asked. So the last few seconds fade
+// down. The fade FINISHES at expiry, not starts then: "stop in 30
+// minutes" means at 30 minutes there is silence.
+
+const SLEEP_FADE_MS = 30_000;
+
+let sleepFadeTimeout: ReturnType<typeof setTimeout> | null = null;
+let sleepFadeTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Cuts the sleep fade in progress, if any. Volume is restored by whoever
+ *  calls (`cutCrossfade`, which is the path all interventions go through). */
+function clearSleepFade() {
+  if (sleepFadeTimeout) clearTimeout(sleepFadeTimeout);
+  sleepFadeTimeout = null;
+  if (sleepFadeTimer) clearInterval(sleepFadeTimer);
+  sleepFadeTimer = null;
+}
+
+/**
+ * Lowers the volume to zero in `ms`. Does not capture the player or its volume:
+ * reads them on each tick and applies the fade as a factor on `effectiveVolume`.
+ * This way it still holds if the track changes midway (ReplayGain is per song)
+ * and the new one doesn't start at full volume.
+ */
+function startSleepFade(ms: number) {
+  if (remoteKind()) return; // the remote device's volume is not ours
+  clearSleepFade();
+  const t0 = Date.now();
+  sleepFadeTimer = setInterval(() => {
+    const x = Math.min(1, (Date.now() - t0) / ms);
+    const p = activePlayer();
+    if (p) {
+      try {
+        p.volume = effectiveVolume(currentSong(usePlayerStore.getState())) * (1 - x);
+      } catch {
+        // ignore
+      }
+    }
+    if (x >= 1) clearSleepFade();
+  }, 100);
+}
+
+/** Schedules the fade to finish right at expiry. */
+function armSleepFade(msLeft: number) {
+  clearSleepFade();
+  const fadeMs = Math.min(SLEEP_FADE_MS, msLeft);
+  const wait = msLeft - fadeMs;
+  if (wait <= 0) startSleepFade(fadeMs);
+  else sleepFadeTimeout = setTimeout(() => startSleepFade(fadeMs), wait);
+}
+
+/** Releases the fade and returns volume to normal: for when the timer is
+ *  canceled with the music already at mid-fade. */
+function abortSleepFade() {
+  if (!sleepFadeTimer && !sleepFadeTimeout) return;
+  clearSleepFade();
+  const p = activePlayer();
+  if (p) {
+    try {
+      p.volume = effectiveVolume(currentSong(usePlayerStore.getState()));
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Pause due to expired sleep timer (from the timeout or onStatus). */
+function fireSleepTimer() {
+  if (sleepTimeout) clearTimeout(sleepTimeout);
+  sleepTimeout = null;
+  // Pause BEFORE restoring volume: the other way around, the fade just left
+  // it at zero and `cutCrossfade` would bring it back to full a few
+  // milliseconds before the pause — a sound burst right at falling asleep,
+  // which is what we're avoiding.
+  clearSleepFade();
+  if (remoteKind()) remotePause();
+  else activePlayer()?.pause();
+  cutCrossfade();
+  usePlayerStore.setState({ isPlaying: false, sleepEndsAt: null });
+}
+
+// ── Audio engine (expo-audio) ───────────────────────────────────────────────
+const players: (AudioPlayer | null)[] = [null, null];
+let activeIdx = 0;
+let audioModeReady = false;
+/** Player that registered lock screen controls (owner of the MediaSession). */
+let lockOwner: AudioPlayer | null = null;
+
+/** Active player (the one playing and driving state), if already exists. */
+function activePlayer(): AudioPlayer | null {
+  return players[activeIdx];
+}
+
+/** Creates (once) the AudioPlayer at `idx` and attaches its listeners. */
+function ensurePlayer(idx: number): AudioPlayer {
+  const existing = players[idx];
+  if (existing) return existing;
+  const p = createAudioPlayer(null, { updateInterval: 500 });
+  // Listeners live for the whole session (players are singletons).
+  // Only the active player feeds state: events from the one that is powering
+  // down during a crossfade (including its didJustFinish) are ignored.
+  p.addListener('playbackStatusUpdate', (status) => {
+    if (activePlayer() === p) onStatus(status);
+  });
+  // Skip track from notification / lock screen → JS manages the queue.
+  // Only the session owner emits these events; there are no double skips.
+  p.addListener('remotePrevious', () => usePlayerStore.getState().previous());
+  p.addListener('remoteNext', () => usePlayerStore.getState().next());
+  p.addListener('remoteFavorite', () => {
+    if (activePlayer() === p) void toggleFavorite(currentSong(usePlayerStore.getState()));
+  });
+  // Dragging the bar of the notification, the lock screen or the car on a
+  // stream the player cannot seek by itself. It reaches us instead of the
+  // player, and `seekTo` is the one that knows how: ask the server for the
+  // stream starting there (see `seekActive`).
+  p.addListener('remoteSeek', ({ positionMs }) => {
+    if (activePlayer() === p) usePlayerStore.getState().seekTo(positionMs / 1000);
+  });
+  // Gapless: the player jumped by itself to the track queued behind this one.
+  p.addListener('trackTransition', () => {
+    if (activePlayer() === p) onTrackTransition();
+  });
+  // What the source says it is playing. Only radio has anything to say here.
+  p.addListener('streamMetadata', (info) => {
+    if (activePlayer() === p) onStreamMetadata(info);
+  });
+  // Equalizer: the native effect attaches to the audio session of THIS player.
+  // Since they are singletons (two alternating for crossfade), it's enough to
+  // do it on creation; the saved state is applied automatically.
+  useEqualizer.getState().attach(p.audioSessionId);
+  players[idx] = p;
+  return p;
+}
+
+/** Configures audio mode (exclusive focus) only once. */
+async function ensureAudioMode() {
+  if (audioModeReady) return;
+  audioModeReady = true;
+  try {
+    // `shouldPlayInBackground` or expo-audio pauses on minimize; `doNotMix` for
+    // exclusive focus, which is what ties the lock screen controls to us.
+    // `playsInSilentMode` because the ringer switch is about interruptions, not
+    // about the album somebody pressed play on: SDK 56 checks it inside
+    // `play()`, so on a phone set to vibrate the button did nothing at all.
+    await setAudioModeAsync({
+      interruptionMode: 'doNotMix',
+      shouldPlayInBackground: true,
+      playsInSilentMode: true,
+    });
+    // Deliberately no `setIsAudioActiveAsync(true)` here. This runs once at
+    // open, and on iOS it is a real `AVAudioSession.setActive(true)`: it takes
+    // the session away from whatever is playing - a podcast, a radio stream -
+    // before the user has pressed anything. The session gets activated on the
+    // first `play()` instead, which is also the only moment we need it.
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * File of a downloaded song, even if the song comes from the server
+ * (in server mode the API `Song` items don't carry `localUri`; downloads
+ * live in the `useDownloads` map).
+ */
+function downloadedUri(song: Song): string | undefined {
+  return useDownloads.getState().files[song.id];
+}
+
+/** A file of this server song on the phone: its download, or its cached copy. */
+function copyOnPhone(song: Song): string | undefined {
+  return downloadedUri(song) ?? cachedUri(song.id);
+}
+
+/**
+ * Can this track be played offline? Radio (own url), local library track
+ * (localUri) or on-disk download or cached copy. Offline, those that only exist
+ * as a server stream cannot be played and must be skipped. A podcast episode's
+ * `url` is the publisher's address, not a stream the phone may reach while
+ * offline mode says no to: only a file on the phone plays it (the same rule
+ * `markUnplayableOffline` and the rows work out).
+ */
+function playableOffline(song: Song | null | undefined): boolean {
+  return !!song && (streamReachable(song) || !!song.localUri || !!copyOnPhone(song));
+}
+
+/** Max streaming bitrate according to current network (Wi-Fi or mobile data). */
+function effectiveMaxBitRate(): number {
+  const s = useSettings.getState();
+  return useNetworkType.getState().cellular ? s.maxBitRateCellular : s.maxBitRate;
+}
+
+/** Codec to transcode to, by network, like the bitrate above it. */
+function effectiveStreamFormat(): TranscodeFormat {
+  const s = useSettings.getState();
+  return useNetworkType.getState().cellular ? s.streamFormatCellular : s.streamFormat;
+}
+
+/**
+ * What a stream of this song asks the server for: the network's quality, unless
+ * the file is lossy and only lossless ones are to be transcoded (#216).
+ */
+export function streamTargetFor(song: Song): { bitRate: number; format: string } {
+  return transcodeTarget(
+    song,
+    effectiveMaxBitRate(),
+    effectiveStreamFormat(),
+    useSettings.getState().streamLosslessOnly,
+  );
+}
+
+/**
+ * The copy of a song that already failed, this run only: `file` sends it to the
+ * server, `stream` back to the disk whatever the setting says. Read by
+ * `localSourceFor`. Not written down, since neither is a property of the song;
+ * a file that is not there is dropped from the catalog (`forgetIfMissing`).
+ */
+const failedSource = new Map<string, 'file' | 'stream'>();
+
+/** Source for expo-audio: radio (url), local (file/content) or Subsonic stream. */
+/**
+ * Does this song play from the file on disk, and which file?
+ *
+ * The download is the default, but a library kept at 128 kbps is a worse copy
+ * than the server's, hence the setting (#108). Offline the question does not
+ * arise. Everything asking "is this a stream?" asks this and not whether a
+ * download exists: seeking, warming and the transcode offset all depend on
+ * where the audio actually comes from.
+ */
+export function localSourceFor(song: Song): string | undefined {
+  const { auth, offline } = useAuthStore.getState();
+  // What the player has already tried and failed to play beats both the setting
+  // and the phone's own copy: one of the two is silence, and the other one may
+  // not be. See `onPlaybackError`.
+  const failed = failedSource.get(song.id);
+  if (failed === 'file' && auth && !offline) return undefined;
+  // The phone's own library is not a download and there is nothing to stream.
+  if (song.localUri) return song.localUri;
+  const file = downloadedUri(song);
+  if (!file) return cachedSourceFor(song, offline || !auth || failed === 'stream');
+  if (offline || !auth) return file;
+  if (failed === 'stream') return file;
+  switch (useSettings.getState().preferDownloads) {
+    case 'never':
+      return undefined;
+    case 'cellular':
+      // An episode file is never transcoded — it IS the publisher's copy — so
+      // on Wi-Fi there is nothing better to stream: the ↓ badge promised no
+      // data, and re-fetching byte-identical bytes breaks that promise.
+      return (song.podcastChannelId || useNetworkType.getState().cellular) ? file : undefined;
+    case 'original':
+      // Downloaded without transcoding, so the file IS the server's copy.
+      // Downloads made before the app recorded this are taken as original,
+      // which is what they were unless the setting said otherwise back then.
+      return useDownloads.getState().dlBitRates[song.id] ? undefined : file;
+    default:
+      return file;
+  }
+}
+
+/**
+ * The cached copy (#180), when it is no worse than what a stream would bring
+ * now: a copy made on mobile data at 128 kbps is not played over a Wi-Fi set
+ * to the original. `always` is for when there is no stream to compare with.
+ */
+function cachedSourceFor(song: Song, always: boolean): string | undefined {
+  const cached = useSongCache.getState().entries[song.id];
+  if (!cached) return undefined;
+  if (always || !cached.bitRate) return cached.uri;
+  const { bitRate } = streamTargetFor(song);
+  return bitRate > 0 && cached.bitRate >= bitRate ? cached.uri : undefined;
+}
+
+function sourceFor(song: Song, timeOffsetSec = 0): AudioSource {
+  const metadata = itemMetadataFor(song);
+  // What the media session calls this track. Without it every item goes out as
+  // `MediaItem.DEFAULT_MEDIA_ID`, the empty string, so a car reading the
+  // session was told the same name for the whole album (#139). The song's id
+  // and not the stream URL: this reaches every connected controller, and the
+  // URL carries the credentials.
+  const mediaId = song.id;
+  // Whether the asset may take its time resolving exact timing. Asked of the
+  // asset on every source, so the setting takes effect on the next track and
+  // on every re-request (a seek with `timeOffset` builds a source too). Local
+  // files get the same answer for free: reading an index you already hold is
+  // not the wait this avoids - the wait is scanning a stream for one.
+  const preferPreciseTiming = useSettings.getState().preferPreciseTiming;
+  // A podcast episode's `url` is the publisher's address. Offline mode says
+  // no to it like to any other request, so only a file on the phone plays it.
+  // Online, a downloaded episode still asks the same question an album song
+  // asks: the ↓ badge promised no data, so the "prefer the file on the phone"
+  // setting decides, and the enclosure is only the stream to fall back to.
+  if (song.url && song.podcastChannelId) {
+    const episodeLocal = localSourceFor(song);
+    if (episodeLocal) return { uri: episodeLocal, metadata, mediaId, preferPreciseTiming };
+    if (!useAuthStore.getState().offline)
+      return { uri: song.url, metadata, mediaId, preferPreciseTiming };
+  } else if (streamReachable(song)) {
+    return { uri: song.url, metadata, mediaId, preferPreciseTiming };
+  }
+  const local = localSourceFor(song);
+  // Counted where the decision is acted on, once per install, and not inside
+  // `localSourceFor`, which every render and every heartbeat asks. "Streamed
+  // although downloaded" is the one that answers the report this exists for:
+  // somebody with the album on the phone hearing it cut out on a bad
+  // connection, which cannot happen to a file.
+  if (local) {
+    bump('player · played the file on disk');
+    return { uri: local, metadata, mediaId, preferPreciseTiming };
+  }
+  bump(
+    downloadedUri(song)
+      ? 'player · streamed although downloaded'
+      : 'player · streamed, nothing downloaded',
+  );
+  const auth = useAuthStore.getState().auth!;
+  const { bitRate, format } = streamTargetFor(song);
+  return {
+    uri: streamUrl(auth, song.id, bitRate, timeOffsetSec, format),
+    metadata,
+    mediaId,
+    preferPreciseTiming,
+  };
+}
+
+// ── Seek in transcoded streams ──────────────────────────────────────────────
+// A stream the server generates on the fly has no random access: native
+// seek bounces or restarts. If the server announces the
+// OpenSubsonic `transcodeOffset` extension, the stream is re-requested with
+// `timeOffset` and the displayed position is compensated (offset + native
+// player time).
+
+/** Real second of the stream at which the player's current source starts. */
+let streamOffsetSec = 0;
+
+/**
+ * Moves that offset, here and on the native player, which is where the media
+ * session reads the position from: a stream re-requested at 2:00 counts from
+ * zero, and the notification and the car went back to 0:00 on every seek
+ * (#135). Every source install comes through here, zeros included. `p` is the
+ * player the source belongs to, not always the one still playing.
+ */
+function setStreamOffset(sec: number, p: AudioPlayer | null = activePlayer()) {
+  streamOffsetSec = sec;
+  try {
+    p?.setSessionPositionOffset(Math.round(sec * 1000));
+  } catch {
+    // Android-only, and only in a build carrying the patch.
+  }
+}
+
+/**
+ * Points the native `loop` at the source the player holds. `loop` repeats THE
+ * SOURCE, and a stream re-requested at 3:25 is not the whole song: looping it
+ * replayed its last seconds forever. Only a source starting at zero may loop;
+ * the rest end and `didJustFinish` restarts the song (see `onStatus`).
+ */
+function applyLoop(p: AudioPlayer | null, offsetSec = streamOffsetSec) {
+  if (!p) return;
+  try {
+    p.loop = usePlayerStore.getState().repeat === 'one' && offsetSec === 0;
+  } catch {
+    // ignore
+  }
+}
+
+/** `transcodeOffset` support of the active server (null = unchecked). */
+let transcodeOffsetSupported: boolean | null = null;
+/**
+ * Does the source have a known length? (null = not loaded yet)
+ *
+ * `isTranscoded` only knows what WE asked for, and Navidrome transcodes on its
+ * own settings too: no `Content-Length`, no ranges, and a native seek restarts
+ * the track. No length on a server stream is that signal, so those seeks also
+ * go through `timeOffset`. Second time round it seeks fine because Navidrome
+ * serves the cached transcode, with length.
+ */
+let sourceHasLength: boolean | null = null;
+
+/** Where a queue with no list behind it came from, for the diagnostics report. */
+let queueOrigin: 'server queue' | 'saved queue' | null = null;
+
+/** Where the queue came from, as far as the state says, for the report. */
+function originOf(st: { radioMode: boolean; sourceHref: string | null; source: string | null }): string {
+  if (st.radioMode) return 'mix';
+  if (st.sourceHref) return st.sourceHref.split('/')[1] || 'home';
+  return queueOrigin ?? (st.source ? 'list' : 'no list');
+}
+
+/** Is this song being transcoded (the server generates it on the fly)? */
+function isTranscoded(song: Song): boolean {
+  // Playing from disk: normal native seek, no timeOffset.
+  if (song.url || localSourceFor(song)) return false;
+  const { bitRate: max, format } = streamTargetFor(song);
+  // Without limit the server serves the original file (direct, native seek).
+  // Forced codec is only sent with `maxBitRate > 0` (see streamUrl), so
+  // outside that there is no transcode.
+  if (max <= 0) return false;
+  // Transcodes if the original exceeds the bitrate OR if an output codec is
+  // forced (the server re-encodes even if the bitrate already fit). In both
+  // cases the stream loses random access and native seek would restart.
+  return format !== '' || (song.bitRate != null && song.bitRate > max);
+}
+
+/** Does seeking this song need a `timeOffset` re-request instead of a native seek? */
+function needsOffsetSeek(song: Song): boolean {
+  // Radio (own url), local library and downloads: real random access. And a
+  // radio must NEVER be re-requested against the Subsonic stream endpoint,
+  // even though its live stream has no length either.
+  if (song.url || localSourceFor(song)) return false;
+  // Already playing an offset segment: its native timeline starts at
+  // `streamOffsetSec`, so a native seek would land that much further ahead.
+  // From here on, every seek is another re-request.
+  if (streamOffsetSec > 0) return true;
+  return isTranscoded(song) || sourceHasLength === false;
+}
+
+/** The answer while it is still being fetched, so two callers ask once. */
+let transcodeOffsetAsking: Promise<boolean> | null = null;
+
+/** Checks (once per profile) if the server can start a stream partway in. */
+async function ensureTranscodeOffsetSupport(): Promise<boolean> {
+  if (transcodeOffsetSupported != null) return transcodeOffsetSupported;
+  // Caching the answer is not enough when two callers arrive before the first
+  // one has it: the second saw `null` and asked again. It happens on the very
+  // first track, which is where this costs a round trip on the way to playing.
+  if (transcodeOffsetAsking) return transcodeOffsetAsking;
+  const auth = useAuthStore.getState().auth;
+  if (!auth) return false; // no session yet: don't cache, re-check later
+  transcodeOffsetAsking = (async () => {
+    try {
+      transcodeOffsetSupported = await supportsTranscodeOffset(auth);
+      return transcodeOffsetSupported;
+    } catch {
+      // Transient network failure: do NOT cache as "not supported", or a single
+      // hiccup would leave all seeks in native mode (restart) for the rest of the
+      // session. Retried on the next seek.
+      return false;
+    } finally {
+      // Only the answer is kept, never the asking: a failure that cached itself
+      // here would be the same hiccup lasting the whole session by another
+      // route.
+      transcodeOffsetAsking = null;
+    }
+  })();
+  return transcodeOffsetAsking;
+}
+
+/**
+ * Seek on the active player: native seek, or a `timeOffset` re-request when the
+ * stream has no random access. Shared by the user's seek and by every path that
+ * restores a saved position, which used to restart those streams from zero too.
+ */
+function seekActive(sec: number) {
+  const state = usePlayerStore.getState();
+  const song = currentSong(state);
+  pendingSeek = { sec, at: Date.now() };
+  usePlayerStore.setState({ positionSec: sec });
+  if (song && episodeMark?.song.id === song.id) {
+    writeEpisodeProgress(sec);
+    episodeMark.armed = false;
+  }
+  // Which of the three ways out this seek took, and whether anybody was
+  // looking. A seek from the car happens with the app in the background, where
+  // half of what this function can do is not certain to run, and the report is
+  // the only place those tell each other apart afterwards: a count of "offset
+  // asked" that the matching "offset answered" never catches up to is the
+  // server round trip below never coming back out there.
+  if (AppState.currentState !== 'active') bump('seek · away');
+  if (!song || !needsOffsetSeek(song)) {
+    bump(activePlayer() ? 'seek · native' : 'seek · no player');
+    activePlayer()?.seekTo(sec);
+    return;
+  }
+  // A stream generated on the fly has no random access: native seek
+  // restarts. It must be re-requested with `timeOffset`, but only if the
+  // server supports it. That answer is warmed asynchronously on track load,
+  // so here we RESOLVE it (don't read a variable that, on a seek right after
+  // loading, would still be unchecked and send us to native seek → restart).
+  // The position and pendingSeek are already set so the slider doesn't bounce
+  // while it decides.
+  bump('seek · offset asked');
+  void ensureTranscodeOffsetSupport().then((supported) => {
+    bump('seek · offset answered');
+    // If the track changed while resolving, don't touch the new player.
+    if (currentSong(usePlayerStore.getState()) !== song) return;
+    const p = activePlayer();
+    if (!p) return;
+    pendingSeek = { sec, at: Date.now() }; // refreshes the wait window
+    if (supported) {
+      setStreamOffset(sec, p);
+      try {
+        replaceSource(p, sourceFor(song, sec));
+        applyLoop(p); // a segment is not the song: it must end to be repeated
+        p.volume = effectiveVolume(song);
+        if (usePlayerStore.getState().isPlaying) p.play();
+        // The new source came with an empty tail: re-queue what comes next.
+        // Nothing in the store changed here, so nobody else would.
+        scheduleNextSource();
+      } catch {
+        // ignore
+      }
+    } else {
+      // No offset support: native seek as best effort.
+      p.seekTo(sec);
+    }
+    usePlayerStore.setState({ positionSec: sec });
+  });
+}
+
+/**
+ * Cover art for the notification and the media session, resolved like every
+ * screen resolves it: that path hands back the file on disk, which is the only
+ * place a cover comes from with no connection.
+ */
+export function artworkUrlFor(song: Song): string | undefined {
+  // A radio has no album to fall back to, but the server may hold an image for
+  // the station, and one picked on the device arrives as a file:// path.
+  const url = coverArtUrl(song.coverArt ?? (song.url ? undefined : song.albumId), COVER.card);
+  // Offline, a cover only in the image cache is no address at all, and the
+  // media session throws on what it cannot parse as a URL.
+  return url?.startsWith(CACHED_COVER) ? undefined : url;
+}
+
+/** How many tracks behind the current one get their covers warmed this way. */
+const ARTWORK_LOOKAHEAD = 6;
+
+/** Covers already handed to the native preloader, once each per session. */
+const warmedArtwork = new Set<string>();
+
+/**
+ * The native module under its own type: the module exports its instance, and
+ * the namespace rule at an import reads nothing off it - this alias keeps the
+ * warming call below going somewhere the compiler checks.
+ */
+const audioModule = AudioModule as NativeAudioModule;
+
+/**
+ * Starts a cover downloading, and its lock screen clip encoding, with no
+ * track attached to it: the queue ahead is warmed this way, so every cover
+ * is on disk well before its track plays and the lock screen has nothing
+ * left to wait for. The native side keeps a small cache of its own - this
+ * set only stops the queue's constant re-evaluation from asking twice.
+ */
+function warmArtwork(song: Song) {
+  // Only the iOS patch has the preloader; asking Android would throw every time.
+  if (Platform.OS !== 'ios') return;
+  const url = artworkUrlFor(song);
+  // A cover the app only holds in its own image cache is no address the
+  // native fetcher can use, and anything already asked for is under way.
+  if (!url || url.startsWith(CACHED_COVER) || warmedArtwork.has(url)) return;
+  try {
+    audioModule.warmArtwork(url);
+    // Only after the call went through: on a build without the patched
+    // module nothing was warmed, and marking it warmed would keep this
+    // session from ever asking again if a later build could.
+    warmedArtwork.add(url);
+  } catch {
+    // A build without the patched module: covers load the old way.
+  }
+}
+
+/**
+ * Hands the lock screen the tall HLS clip from the animated-artwork
+ * endpoint for this track — or clears it when there is none. Keyed by the
+ * static cover, so a clip arriving late still lands on the track it was
+ * fetched for, never on the next one. iOS only, like the preloader: the
+ * patched module answers, anything else throws into the catch.
+ */
+// The clips are mostly asked for on a track change with the app in the
+// background, where React Native's fetch does not answer.
+setAnimatedArtworkFetch((url, init) => expoFetch(url, init));
+
+function motionNetworkAllowed(): boolean {
+  return artworkNetworkAllowed(useSettings.getState().motionArtworkWifiOnly, useNetworkType.getState());
+}
+
+function publishAnimatedClip(song: Song) {
+  if (Platform.OS !== 'ios') return;
+  const artworkUrl = artworkUrlFor(song);
+  // Nothing to key a clearing by — and a stale key never matches a new
+  // cover anyway, so nothing leaks across tracks.
+  if (!artworkUrl) return;
+  const endpoint = activeArtworkEndpoint(useSettings.getState());
+  const customs = useSettings.getState().animatedArtworkUrls;
+  const customUrl = customs[animatedArtworkKey(song.artist ?? '', song.album ?? '')];
+  const artist = song.artist;
+  const album = song.album ?? '';
+  if (!motionNetworkAllowed() || !endpoint || !artist || !album) {
+    try {
+      audioModule.setAnimatedClipUrls(artworkUrl, null);
+    } catch {
+      // A build without the patched module: static covers as always.
+    }
+    return;
+  }
+  void fetchAnimatedArtwork(endpoint, artist, album, customUrl).then((clips) => {
+    try {
+      audioModule.setAnimatedClipUrls(artworkUrl, motionNetworkAllowed() ? clips?.tall ?? null : null);
+    } catch {
+      // A build without the patched module: static covers as always.
+    }
+    note(`clip ${clips?.tall ? 'tall ok' : 'none'} for ${album}`);
+    // The export lands seconds later, if at all: ask the native side what
+    // became of it, while this track is still the one playing.
+    for (const afterMs of [4000, 12000]) {
+      setTimeout(() => {
+        if (currentSong(usePlayerStore.getState())?.id !== song.id) return;
+        try {
+          const state = audioModule.animatedClipState();
+          note(`clip state ${state.stage}${state.detail ? ` ${state.detail}` : ''} for ${album}`);
+        } catch {
+          // A build without the patched module: nothing to ask.
+        }
+      }, afterMs);
+    }
+  });
+}
+
+/**
+ * What the media session says this track is. Bluetooth, the car and the
+ * system's controls read this, not the notification, and it beats the stream's
+ * tags, which a transcode strips (#78).
+ *
+ * A radio goes without title or artist on purpose: the stream fills those in
+ * track by track (`onStreamMetadata`) and anything here would outrank it.
+ *
+ * The duration goes with it because a transcode cannot report one, and without
+ * it the system's controls show no times and no progress bar (#116). Only a
+ * fallback: a source with a length still speaks for itself.
+ */
+function itemMetadataFor(song: Song): AudioMetadata {
+  const artworkUrl = artworkUrlFor(song);
+  if (song.url) return { artworkUrl };
+  return {
+    title: song.title,
+    artist: song.artist ?? undefined,
+    albumTitle: song.album ?? undefined,
+    artworkUrl,
+    durationMs: song.duration && song.duration > 0 ? Math.round(song.duration * 1000) : undefined,
+  };
+}
+
+function metadataFor(song: Song): AudioMetadata {
+  // A radio that says what it is playing says it here too. Only in the two
+  // lines every song has: the station is not an album and does not go in the
+  // album's place.
+  const live = liveInfo(song);
+  return {
+    title: live?.title ?? song.title,
+    artist: live?.artist ?? song.artist ?? undefined,
+    albumTitle: song.album ?? undefined,
+    artworkUrl: artworkUrlFor(song),
+    // iOS reads it here, for a transcoded stream AVPlayer can't time
+    // (`itemMetadataFor` is the same fallback on Android).
+    durationMs: !song.url && song.duration && song.duration > 0 ? Math.round(song.duration * 1000) : undefined,
+  };
+}
+
+/**
+ * Applies metadata to lock screen. If `p` is not yet the session owner, it
+ * registers it in its name (first time, or transfer to the other player in
+ * crossfade: the native service moves the notification and MediaSession to
+ * the new player).
+ */
+function applyLockScreen(p: AudioPlayer, song: Song) {
+  const meta = metadataFor(song);
+  if (lockOwner === p) {
+    p.updateLockScreenMetadata(meta);
+    applyLockScreenFavorite(p, song);
+    return;
+  }
+  lockOwner = p;
+  p.setActiveForLockScreen(true, meta, {
+    showSeekForward: false,
+    showSeekBackward: false,
+    showSkipPrevious: true,
+    showSkipNext: true,
+  });
+  applyLockScreenFavorite(p, song);
+}
+
+/** What each player's session was last told about the heart. */
+const lockFavoriteSent = new WeakMap<AudioPlayer, string>();
+
+/**
+ * The heart on the notification and the lock screen (Android Auto has its own,
+ * see `CarAutoSync`). Hidden for a radio. Set on every track change here, and again
+ * whenever the favourites list changes (see the bottom of this file).
+ */
+function applyLockScreenFavorite(p: AudioPlayer, song: Song) {
+  const favorite = favoriteState(song);
+  // The list reports every step of a refetch; the notification is only
+  // redrawn when the heart actually changes.
+  const key = `${song.id}|${favorite}`;
+  if (lockFavoriteSent.get(p) === key) return;
+  lockFavoriteSent.set(p, key);
+  try {
+    p.setLockScreenFavorite(favorite, favorite == null ? null : favoriteLabel(favorite));
+  } catch {
+    // Android-only, and only in a build carrying the patch.
+  }
+}
+
+// ── What a radio says it is playing ─────────────────────────────────────────
+// A station is one item in the queue and stays there for hours, so the queue
+// cannot say what is on. The stream can: it announces every track as it starts
+// (ICY metadata, which ExoPlayer asks for by itself and hands over as it
+// arrives). Not every stream sends it, and the one that does keeps sending it
+// while the same station plays.
+
+/** What the stream playing `song` says is on, or null if it says nothing. */
+function liveInfo(song: Song | null | undefined): StreamInfo | null {
+  // A podcast episode is a file with its own tags (vod), not a station that
+  // announces what it plays: it never has live info.
+  return song?.url && !song.vod ? usePlayerStore.getState().streamInfo : null;
+}
+
+/**
+ * ICY carries a single line, and what everyone puts in it is "Artist - Title".
+ * It is a habit rather than a rule, so a stream that fills the artist in on its
+ * own is believed over the split. Nothing to show gives null.
+ */
+function parseStreamInfo(info: { title?: string; artist?: string }): StreamInfo | null {
+  const raw = info.title?.trim();
+  if (!raw) return null;
+  const artist = info.artist?.trim();
+  if (artist) return { title: raw, artist };
+  const sep = raw.indexOf(' - ');
+  if (sep <= 0) return { title: raw };
+  return { title: raw.slice(sep + 3).trim(), artist: raw.slice(0, sep).trim() };
+}
+
+/**
+ * Reads what the source announced. Only radio uses it: everything else comes
+ * with the server's tags, which beat whatever the decoder scrapes out of a
+ * file, and a download would suddenly rename itself to whatever is inside it.
+ * A podcast episode is the same as a download — a file with its own tags, not a
+ * station announcing itself — so it is excluded here too.
+ */
+function onStreamMetadata(info: { title?: string; artist?: string }) {
+  const song = currentSong(usePlayerStore.getState());
+  // Between two tracks a stream can go quiet, and that is not a reason to keep
+  // showing the one before, so an empty announcement is applied like any other.
+  const next = song?.url && !song.vod ? parseStreamInfo(info) : null;
+  const prev = usePlayerStore.getState().streamInfo;
+  if (prev?.title === next?.title && prev?.artist === next?.artist) return;
+  usePlayerStore.setState({ streamInfo: next });
+  // The notification and the car read the same thing, and this is the only
+  // moment they get to hear about it.
+  const p = activePlayer();
+  if (song && p && lockOwner === p) applyLockScreen(p, song);
+}
+
+/** Removes lock screen controls (profile change or remote output). */
+function clearLockScreen() {
+  if (!lockOwner) return;
+  try {
+    lockOwner.clearLockScreenControls();
+  } catch {
+    // ignore
+  }
+  lockOwner = null;
+}
+
+// ── Salida remota (renderer UPnP/DLNA) ─────────────────────────────────────
+
+/** Active remote output, if any. */
+function remoteKind(): 'upnp' | 'jukebox' | null {
+  if (isUpnpConnected()) return 'upnp';
+  if (isJukeboxActive()) return 'jukebox';
+  return null;
+}
+
+function remotePlay() {
+  if (isJukeboxActive()) void jukeboxPlay();
+  else void upnpPlay();
+}
+
+function remotePause() {
+  if (isJukeboxActive()) void jukeboxPause();
+  else void upnpPause();
+}
+
+function remoteSeek(sec: number) {
+  if (isJukeboxActive()) void jukeboxSeek(sec);
+  else void upnpSeek(sec);
+}
+
+/** Set by `bringPlaybackToPhone`: the phone picks up playing, not paused. */
+let resumeOnPhone = false;
+
+/**
+ * Takes what a renderer or the jukebox is playing back to the phone, at the
+ * same second and still playing if it was (#272).
+ */
+export async function bringPlaybackToPhone(): Promise<void> {
+  const kind = remoteKind();
+  if (!kind) return;
+  resumeOnPhone = usePlayerStore.getState().isPlaying;
+  note(`output back to the phone from ${kind}`);
+  if (kind === 'upnp') await upnpDisconnect();
+  else await jukeboxDisconnect();
+}
+
+function remoteSetVolume(volume: number) {
+  if (isJukeboxActive()) jukeboxSetVolume(volume);
+  else upnpSetVolume(volume);
+  // Reflect the exact value back in the system volume overlay, which both
+  // outputs show through the CastMedia session.
+  castSetVolumeLevel(volume);
+}
+
+/**
+ * Syncs the casting media session (lock screen notification + volume buttons)
+ * with the current track/state. For the jukebox too: nothing plays on the
+ * phone there either, so without this session the volume buttons moved the
+ * phone's own volume and never reached the server (#270).
+ */
+function syncCastMedia(): void {
+  if (!remoteKind()) return;
+  const st = usePlayerStore.getState();
+  const song = currentSong(st);
+  if (!song) return;
+  castUpdate({
+    title: song.title,
+    artist: song.artist ?? undefined,
+    album: song.album ?? undefined,
+    artworkUrl: artworkUrlFor(song),
+    durationMs: (song.duration ?? st.durationSec) * 1000,
+    positionMs: st.positionSec * 1000,
+    isPlaying: st.isPlaying,
+  });
+  // Seed the system volume overlay with the current level (otherwise it shows
+  // the provider's initial 50% until the first hardware button press).
+  castSetVolumeLevel(st.volume);
+}
+
+/**
+ * What the jukebox may go on to by itself after the song at `index`. Nothing
+ * when the song is meant to end there: repeat one and "end of song" are the
+ * app's to answer in `onFinished`.
+ */
+function jukeboxUpcoming(index: number): Song[] {
+  const st = usePlayerStore.getState();
+  if (st.repeat === 'one' || st.sleepAtSongEnd) return [];
+  return st.queue.slice(index + 1);
+}
+
+function syncJukeboxUpcoming() {
+  if (remoteKind() !== 'jukebox') return;
+  const { queue, index } = usePlayerStore.getState();
+  if (queue[index]) void jukeboxSyncUpcoming(queue[index], jukeboxUpcoming(index));
+}
+
+/** Loads the track at `index` into the remote output and syncs state. */
+async function remoteLoadIndex(index: number, autoplay: boolean, startSec = 0) {
+  const state = usePlayerStore.getState();
+  const song = state.queue[index];
+  if (!song) return;
+  resetListen();
+  const ok = isJukeboxActive()
+    ? await jukeboxLoad(song, autoplay, startSec, jukeboxUpcoming(index))
+    : await loadUpnpRemoteTrack(
+        {
+          queue: state.queue,
+          index,
+          positionSec: startSec,
+          isPlaying: autoplay,
+          shuffle: state.shuffle,
+          repeat: state.repeat,
+        },
+        autoplay,
+      );
+  if (!ok) {
+    const { devices, deviceId } = useUpnp.getState();
+    const device = isJukeboxActive() ? 'jukebox' : devices.find((d) => d.id === deviceId)?.name ?? '?';
+    note(`cast refused: ${song.suffix ?? '?'} on ${device}`);
+    useToast.getState().show(tg("This song can't be cast"));
+    usePlayerStore.setState({ index, isPlaying: false, isBuffering: false });
+    return;
+  }
+  usePlayerStore.setState({
+    index,
+    positionSec: startSec,
+    durationSec: song.duration ?? 0,
+    isPlaying: autoplay,
+    isBuffering: autoplay,
+  });
+  onTrackChanged(song);
+}
+
+/**
+ * Maintains the "queued" block (manually added songs, contiguous after the
+ * current one) on track change: advancing to the next consumes one; jumping to
+ * any other position dissolves the block (becomes a normal queue).
+ */
+function consumeQueuedOnIndexChange(next: number) {
+  const st = usePlayerStore.getState();
+  const queuedCount = queuedAfterMove(st, next);
+  if (queuedCount !== st.queuedCount) usePlayerStore.setState({ queuedCount });
+}
+
+// ── Episode progress ─────────────────────────────────────────────────────────
+// The saved queue only knows the second of its current track, so playing
+// anything else forgot where an episode was left.
+
+/** How far an episode moves between writes. */
+const EPISODE_SAVE_SEC = 5;
+
+/**
+ * The episode in the player and the last second written for it. Until a beat
+ * lands near that second (`armed`) none are believed: one from the previous
+ * source, or a seek that never took, would overwrite where it was left.
+ */
+let episodeMark: { song: Song; sec: number; armed: boolean; played?: boolean } | null = null;
+
+function markEpisode(song: Song, sec: number) {
+  episodeMark = song.podcastChannelId ? { song, sec, armed: false } : null;
+}
+
+function writeEpisodeProgress(sec: number) {
+  const mark = episodeMark;
+  if (!mark?.song.podcastChannelId) return;
+  mark.sec = sec;
+  const durationSec = usePlayerStore.getState().durationSec || (mark.song.duration ?? 0);
+  const played = episodePlayed(sec, durationSec);
+  const crossed = played !== mark.played;
+  mark.played = played;
+  void saveEpisodeProgress(hashKey(profileScopeId()), {
+    id: mark.song.id,
+    channelId: mark.song.podcastChannelId,
+    positionSec: sec,
+    durationSec,
+  })
+    .then(() => {
+      if (crossed) queryClient.invalidateQueries({ queryKey: ['podcastPlayed'] });
+    })
+    .catch(() => {});
+}
+
+/**
+ * An episode was marked by hand. If it is the one in the player, its beats would
+ * undo the mark: played stops recording it, unplayed goes back to the start.
+ */
+export function episodeMarkedByHand(id: string, played: boolean) {
+  const st = usePlayerStore.getState();
+  const song = currentSong(st);
+  if (song?.id !== id) return;
+  if (played) {
+    episodeMark = null;
+    return;
+  }
+  markEpisode(song, 0);
+  st.seekTo(0);
+}
+
+function noteEpisodeBeat(status: AudioStatus, justPaused: boolean) {
+  const mark = episodeMark;
+  if (!mark || !status.isLoaded || status.isBuffering) return;
+  const sec = status.currentTime ?? 0;
+  if (!mark.armed) {
+    if (Math.abs(sec - mark.sec) < 3) mark.armed = true;
+    return;
+  }
+  if (justPaused || Math.abs(sec - mark.sec) >= EPISODE_SAVE_SEC) writeEpisodeProgress(sec);
+}
+
+/** Where to pick `song` up, or null when it is no episode or was never left. */
+async function storedEpisodeResume(song: Song | undefined): Promise<number | null> {
+  if (!song?.podcastChannelId) return null;
+  const left = await getEpisodeProgress(hashKey(profileScopeId()), song.id).catch(() => undefined);
+  if (!left) return null;
+  return episodeResumeAt(left.positionSec, left.durationSec || (song.duration ?? 0));
+}
+
+/** The player moved to `song` on its own (gapless, crossfade): it starts at zero. */
+function resumeEpisodeAfterMove(song: Song) {
+  markEpisode(song, 0);
+  void storedEpisodeResume(song).then((sec) => {
+    if (sec && currentSong(usePlayerStore.getState())?.id === song.id) seekActive(sec);
+  });
+}
+
+/** Which load is in charge, so an older one can tell it has been overtaken. */
+let loadToken = 0;
+
+/**
+ * Loads the track at `index` and (optionally) plays it.
+ *
+ * False means nothing was installed and what was playing still is, so a caller
+ * can put its queue back. Anything failing AFTER the source is in the player
+ * says true: showing one song while another sounds is the one thing this must
+ * never do.
+ */
+/** The load that holds the speculation gate has not reported a playable source. */
+let awaitingSource = false;
+
+async function loadIndex(index: number, autoplay: boolean): Promise<boolean> {
+  const token = ++loadToken;
+  // Anything asked to play is the app in use, whoever asked: the button, the
+  // notification, the car, a headset. The window is only for the track the
+  // saved queue brings back on its own.
+  if (autoplay) endBootQuiet();
+  // Offline, a stream-only track cannot play: skip to the next one that can
+  // rather than get stuck. `nextIndex` already avoids this during a normal
+  // advance, so this covers the rest (previous, taps, queue restore).
+  if (useAuthStore.getState().offline) {
+    const q = usePlayerStore.getState().queue;
+    if (q[index] && !playableOffline(q[index])) {
+      let target = -1;
+      for (let i = index + 1; i < q.length; i++) {
+        if (playableOffline(q[i])) {
+          target = i;
+          break;
+        }
+      }
+      if (target === -1) {
+        usePlayerStore.setState({ isPlaying: false });
+        // Only when playing was actually asked for. Restoring the saved queue
+        // on a cold start also comes through here, and answering a tap nobody
+        // gave is how the toast ended up greeting people who open the app
+        // offline.
+        if (autoplay) useToast.getState().show(tg('Nothing here is downloaded'));
+        return false;
+      }
+      index = target;
+    }
+  }
+  cutCrossfade();
+  pendingSeek = null;
+  setStreamOffset(0);
+  sourceHasLength = null; // unknown until the new source is loaded
+  resetListen();
+  playerFailed = false;
+  consumeQueuedOnIndexChange(index);
+  const asked = usePlayerStore.getState().queue[index];
+  const resumeSec = (await storedEpisodeResume(asked)) ?? 0;
+  if (token !== loadToken) return true;
+  if (remoteKind()) {
+    await remoteLoadIndex(index, autoplay, resumeSec);
+    return true;
+  }
+  await ensureAudioMode();
+  // Loading waits, and a queue can be rewritten while it does: another tap,
+  // the mix filling itself in, the shuffle being dealt again. Reading the song
+  // before the wait and installing it after handed the player a song from the
+  // queue that no longer exists, while the screen went on describing the one
+  // that does — the report was tapping a song and being shown a different one,
+  // with the right audio. Whoever came last owns playback; this one is done.
+  if (token !== loadToken) return true;
+  const song = usePlayerStore.getState().queue[index];
+  if (!song) return false;
+  // A song with no duration draws 0:00 and every seek on the bar lands on zero.
+  // The keys say which code built the song object, which is the open question.
+  if (!song.duration && !song.url) {
+    bump('player · song with no duration');
+    note(
+      `song with no duration: ${song.id} · from ${originOf(usePlayerStore.getState())} · keys ${Object.keys(song).sort().join(',')}`,
+    );
+  }
+  const p = ensurePlayer(activeIdx);
+  // The player may have just been created, so the reset above had nothing to
+  // reach: this source starts at the beginning either way.
+  setStreamOffset(0, p);
+  // Equalizer re-attachment: when creating the player the audio session may not
+  // be assigned yet. It's idempotent (native ignores duplicate sessions and id 0),
+  // so it's cheap to ensure it here.
+  useEqualizer.getState().attach(p.audioSessionId);
+  try {
+    replaceSource(p, sourceFor(song));
+  } catch (e) {
+    // Counted apart from the failures the player reports on its own: this one
+    // never got as far as the player, and the two look identical from the
+    // outside: the same toast over a song that does not start. A report of one
+    // is unanswerable without knowing which it was (see `onPlaybackError`).
+    bump(`player · could not install the source (${errorTag(String(e))})`);
+    note(`could not install the source: ${errorTag(String(e))} · ${song.id}`);
+    useToast.getState().show(tg("Couldn't play the song"));
+    return false;
+  }
+  // A song somebody asked for goes first; `onStatus` opens the gate once it has
+  // started. Not one of these waits for a server: a file, a station, a restore.
+  awaitingSource = autoplay && !song.url && !localSourceFor(song);
+  if (awaitingSource) holdSpeculation();
+  else releaseSpeculation();
+  // The player is holding this song now and whatever it held before is gone,
+  // so the screen follows it here and not one line later: everything below can
+  // fail, and none of it can put the old song back.
+  usePlayerStore.setState({
+    index,
+    positionSec: 0,
+    durationSec: song.duration ?? 0,
+    isPlaying: autoplay,
+    isBuffering: autoplay,
+  });
+  const startSec = song.id === asked?.id ? resumeSec : 0;
+  markEpisode(song, startSec);
+  try {
+    applyLoop(p);
+    // Effective volume of THIS song (user × ReplayGain).
+    p.volume = effectiveVolume(song);
+    applySpeed(p, song);
+    if (startSec > 0) seekActive(startSec);
+    if (autoplay) p.play();
+    applyLockScreen(p, song);
+    onTrackChanged(song);
+    // `playQueue` installs the queue before this player/source exists, so the
+    // store subscription's first attempt to enqueue the following track has
+    // nothing to act on. Queue it again now that `replace()` has installed the
+    // current media item. Without this, the first album transition still falls
+    // back to didJustFinish → replace(), leaving an audible gap.
+    // Both of these reach the server, and neither is needed before the first
+    // play, so on the way in they wait for the boot window to close.
+    if (!bootQuiet) {
+      scheduleNextSource();
+      // Warms up the "does it support timeOffset?" answer so the first seek
+      // on a transcoded stream already has the answer cached. For ANY server
+      // stream: the transcode may be the server's decision, and we only find
+      // out when the source loads without a length (see `sourceHasLength`).
+      if (!song.url && !localSourceFor(song)) {
+        void ensureTranscodeOffsetSupport();
+      }
+    }
+  } catch (e) {
+    // The song is in the player: say so, whatever went wrong on the way to
+    // making it sound. Answering false here is what left the screen describing
+    // the song before it while this one played.
+    bump(`player · loaded but did not start (${errorTag(String(e))})`);
+    useToast.getState().show(tg("Couldn't play the song"));
+  }
+  return true;
+}
+
+// ── "Back" history, Spotify-style ────────────────────────────────────────────
+// Stack of already-played contexts so the previous button/gesture, once at the
+// start of the queue, returns to the song played before it even if it comes
+// from a different playlist or album. Pushed on each advance/skip forward
+// and popped in previous(). Entries share the `queue` reference within the
+// same context, so they only weigh what changes between skips.
+type HistoryEntry = {
+  queue: Song[];
+  index: number;
+  source: string | null;
+  sourceHref: string | null;
+  originalQueue: Song[] | null;
+  shuffle: boolean;
+  queueDealt: boolean;
+};
+const HISTORY_MAX = 100;
+let playedHistory: HistoryEntry[] = [];
+
+/**
+ * Why the queue is moving, which decides whether paused stays paused.
+ *
+ * `skip` is stepping through: ⏭, ⏮ and the swipe across the player's cover.
+ * `pick` is choosing one, out of the queue or the car's list, and that is an
+ * instruction to play it whatever the setting says.
+ */
+export type JumpKind = 'pick' | 'skip';
+
+/**
+ * Whether a skip should start playback. `true` until the setting is on:
+ * skipping has started the music here since the first version, media3 does the
+ * opposite, and the muscle memory is ours. With it on, the paused state carries
+ * across the skip, which is what somebody stepping past a track wants (#110).
+ */
+function skipAutoplay(playing: boolean): boolean {
+  return useSettings.getState().keepPausedOnSkip ? playing : true;
+}
+
+/** Pushes the current context before advancing or skipping to another track. */
+function pushHistory() {
+  const { queue, index, source, sourceHref, originalQueue, shuffle, queueDealt } =
+    usePlayerStore.getState();
+  if (!queue[index]) return;
+  playedHistory.push({ queue, index, source, sourceHref, originalQueue, shuffle, queueDealt });
+  if (playedHistory.length > HISTORY_MAX) playedHistory.shift();
+}
+
+/** What tells one playing context from another: the screen it came from, and
+ *  its name when it has no screen (the library shuffle, a mix). */
+function contextKey(source: string | null, sourceHref: string | null) {
+  return sourceHref ?? source ?? null;
+}
+
+/**
+ * Forgets the back history of a list being started again: its entries point
+ * into the queue about to be replaced, so ⏮ walked back into the discarded one
+ * (#100). Other lists keep theirs.
+ */
+function forgetHistoryOf(key: string) {
+  playedHistory = playedHistory.filter((e) => contextKey(e.source, e.sourceHref) !== key);
+}
+
+// ── Honest scrobble ──────────────────────────────────────────────────────────
+// Starting a track only announces it; the listen is sent on crossing the
+// threshold in the settings (50% or 4 minutes by default), so skipping does not
+// inflate anybody's history. The offline counter and the outbox follow the same
+// rule.
+//
+// What counts is time actually heard, not where the playhead is: a queue
+// restored at 80% on launch, a seek to the chorus or a handoff back from a
+// speaker all land past the threshold without anybody listening to it.
+let scrobbledThisTrack = false;
+/** Seconds of this track that playback itself has covered. */
+let heardSec = 0;
+/** Where and when the last playing beat left off, or null while paused. */
+let heardMark: { pos: number; at: number } | null = null;
+
+/** A track (or a repeat of it) starts: nothing of it has been heard yet. */
+function resetListen() {
+  scrobbledThisTrack = false;
+  heardSec = 0;
+  heardMark = null;
+}
+
+/** Adds what the playhead moved since the last beat, if playback moved it. */
+function noteHeard(positionSec: number, playing: boolean) {
+  const now = Date.now();
+  const mark = heardMark;
+  heardMark = playing ? { pos: positionSec, at: now } : null;
+  if (!playing || !mark) return;
+  const moved = positionSec - mark.pos;
+  // Playback can only cover as much as the clock allows at this speed; a jump
+  // past that is a seek. The second and a half absorbs beats that arrive late.
+  const speed = usePlayerStore.getState().speed || 1;
+  const allowed = ((now - mark.at) / 1000) * speed + 1.5;
+  if (moved > 0 && moved <= allowed) heardSec += moved;
+}
+
+// ── What the server's Now Playing panel shows ────────────────────────────────
+// The announcement ("now playing") is one message at the start of a track and
+// there is no second one: the server gives the entry the rest of the track to
+// live and hears nothing after that, so pausing, emptying the queue or closing
+// the app all left the song running in Navidrome's panel until it would have
+// ended. Servers with the OpenSubsonic `playbackReport` extension take
+// the state instead, so those get told about the pause and the stop as well.
+// The rest keep the announcement, which is all the classic API can say.
+
+/** Support for `playbackReport`, per profile (`reset` clears it). */
+let playbackReportSupported: boolean | null = null;
+
+/** The answer while it is still being fetched. See the one above it. */
+let playbackReportAsking: Promise<boolean> | null = null;
+
+/** Checks (once per profile) whether the server takes playback state. */
+async function ensurePlaybackReportSupport(auth: SubsonicAuth): Promise<boolean> {
+  if (playbackReportSupported != null) return playbackReportSupported;
+  if (playbackReportAsking) return playbackReportAsking;
+  playbackReportAsking = (async () => {
+    try {
+      playbackReportSupported = await supportsPlaybackReport(auth);
+      return playbackReportSupported;
+    } catch (e) {
+      // A server that refuses the question has answered it: an old Subsonic
+      // doesn't know the method, and remembering that keeps every pause from
+      // asking again. A network failure is not an answer, and caching it would
+      // leave the whole session on the announcement over one hiccup, so that one
+      // is asked again on the next change.
+      if (e instanceof SubsonicRequestError && !e.network) playbackReportSupported = false;
+      return false;
+    } finally {
+      playbackReportAsking = null;
+    }
+  })();
+  return playbackReportAsking;
+}
+
+/**
+ * Tells the server what playback is doing. Best effort in every sense: it is
+ * about this moment, so one that didn't arrive is stale by the time anyone
+ * could retry it. The listen (`maybeScrobbleThreshold`) is the one that is kept.
+ *
+ * A song is only reported when the server is the one it came from: radio has
+ * no id there, and a local profile has no server to tell.
+ */
+function reportState(state: PlaybackState, song: Song | undefined, positionSec: number): void {
+  if (!song || song.url) return;
+  // Counted because of what the panel on the server shows: `starting` is the
+  // one report that says "from the top", so more of them than there were songs
+  // means something is announcing a track that was already playing, and that is
+  // a different fault from the position not being repeated.
+  bump(`report · ${state}`);
+  const { auth, offline } = useAuthStore.getState();
+  if (!auth || offline) return;
+  void ensurePlaybackReportSupport(auth).then((supported) => {
+    // The account may have gone, or gone offline, while it was being asked.
+    const now = useAuthStore.getState();
+    if (now.auth !== auth || now.offline) return;
+    noteOwnReport(song.id);
+    if (!supported) {
+      // The classic API only knows how to say "this started", so the rest is
+      // nothing it could carry.
+      if (state === 'starting') void scrobble(auth, song.id, false).catch(() => {});
+      return;
+    }
+    void reportPlayback(auth, song.id, state, positionSec).catch(() => {});
+  });
+}
+
+/** Sends the real scrobble once per track when crossing the threshold. */
+function maybeScrobbleThreshold(positionSec: number, playing: boolean) {
+  if (scrobbledThisTrack) return;
+  noteHeard(positionSec, playing);
+  const st = usePlayerStore.getState();
+  const song = st.queue[st.index];
+  if (!song || song.url) return; // radios are not scrobbled
+  const duration = st.durationSec || song.duration || 0;
+  const { scrobblePercent, scrobbleSeconds } = useSettings.getState();
+  const threshold = scrobbleThresholdSec(duration, scrobblePercent, scrobbleSeconds);
+  // Both rules off: nothing is ever reported, here or to the outbox, which is
+  // what somebody who turned both off asked for.
+  if (threshold === null || heardSec < threshold) return;
+  scrobbledThisTrack = true;
+  const at = Date.now();
+  const { auth, offline } = useAuthStore.getState();
+  // The listen is remembered locally whatever happens to the server: it feeds
+  // "Most played" on this phone, which is nobody else's business.
+  if (offline) {
+    usePlayCounts.getState().bump(song.id);
+    bump(auth ? 'scrobble · to outbox' : 'scrobble · local profile');
+    if (auth) useOfflineQueue.getState().addPlay(song.id, at);
+    return;
+  }
+  if (!auth) return; // a local profile has no server to tell
+  // Online, so it goes straight up. But "online" is only what the mode says,
+  // and the mode is a guess that takes two failed probes to change its mind:
+  // there is a window on the way out of the house, and a whole trip if
+  // nothing was downloaded to fall back to, where the app is still calling
+  // itself online and the server is not there. Every listen in it used to be
+  // handed to a promise nobody was waiting on, and lost the moment it failed
+  // (#126). A refusal from the network puts it in the same outbox an offline
+  // one goes to, dated, so it goes up on the next reconnection either way.
+  bump('scrobble · sent');
+  scrobble(auth, song.id, true).catch((e) => {
+    if (!(e instanceof SubsonicRequestError) || !e.network) {
+      bump('scrobble · server refused');
+      return;
+    }
+    bump('scrobble · to outbox (no network)');
+    usePlayCounts.getState().bump(song.id);
+    useOfflineQueue.getState().addPlay(song.id, at);
+  });
+}
+
+/** Waiting to warm the next song's lyrics (see `onTrackChanged`). */
+let nextLyricsTimer: ReturnType<typeof setTimeout> | null = null;
+const NEXT_LYRICS_DELAY_MS = 5000;
+
+// ── The first seconds of the app ────────────────────────────────────────────
+// Restoring the queue loads its track, and everything that follows a track
+// change goes with it: Now Playing, lyrics, the warming, the transcode probe
+// and the queued source. Seven requests in the instant the app is painting
+// itself, worth a second of opening on a song from the server.
+//
+// So they wait for the first sign the app is in use, or for the window below.
+// The track does NOT wait: held back, it left a queue on screen with no player
+// behind it, and Play from the notification or the car found none.
+
+const BOOT_QUIET_MS = 5000;
+
+/** Whether the app is still opening, and speculative work stays out of it. */
+let bootQuiet = false;
+let bootQuietTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Opens the window. Called where the saved queue is restored. */
+function startBootQuiet() {
+  bootQuiet = true;
+  if (bootQuietTimer) clearTimeout(bootQuietTimer);
+  bootQuietTimer = setTimeout(() => endBootQuiet(true), BOOT_QUIET_MS);
+}
+
+/**
+ * Closes the window. Idempotent, and called by whatever comes first: the timer,
+ * or the app being used.
+ *
+ * `catchUp` is for the two cases that leave the track where it is: the window
+ * running out on its own, and Play being pressed on what was restored. Anything
+ * that loads another track says no, because installing it does this again for
+ * the song that is actually going to be heard, and doing it here would be
+ * warming up the one being left behind.
+ */
+function endBootQuiet(catchUp = false) {
+  if (!bootQuiet) return;
+  bootQuiet = false;
+  if (bootQuietTimer) clearTimeout(bootQuietTimer);
+  bootQuietTimer = null;
+  if (!catchUp) return;
+  const song = currentSong(usePlayerStore.getState());
+  if (!song) return;
+  if (!song.url && !localSourceFor(song)) void ensureTranscodeOffsetSupport();
+  scheduleNextSource();
+  prefetchLyrics(song);
+  warmUpcoming();
+  cacheUpcoming();
+}
+
+/** Now playing / history + syncs the queue on track change. */
+function onTrackChanged(song: Song) {
+  // A new track is a new context for everything the old one left pending.
+  stopBgRetry();
+  gaveUp = null;
+  // Whatever the last stream announced was about the last stream. The
+  // notification was built from it moments ago (this runs right after
+  // `applyLockScreen`), so it has to be told again, or a station with nothing
+  // to say would keep showing the previous one's track.
+  if (usePlayerStore.getState().streamInfo) {
+    usePlayerStore.setState({ streamInfo: null });
+    const p = activePlayer();
+    if (p && lockOwner === p) applyLockScreen(p, song);
+  }
+  // Only "I'm listening to this"; playback counts only when crossing the
+  // threshold. Nothing is sent offline: a server account with no connection has
+  // no one to tell. A track can also be loaded without playing (the queue
+  // restored on reopen, the undo of a stop), and that is not a listen starting.
+  const st = usePlayerStore.getState();
+  // Not while the app is still opening: the queue coming back is not somebody
+  // listening, and this is a request to the server (see the block above).
+  if (!bootQuiet) reportState(st.isPlaying ? 'starting' : 'paused', song, st.positionSec);
+  usePlayHistory.getState().record(song);
+  // Warm up lyrics for what is playing. The next song's are warmed too, so
+  // swiping in the player shows its card instantly, but a few seconds later:
+  // a track change is the busiest moment there is, and the phone only holds a
+  // handful of connections to the server at once, so speculative requests sent
+  // right then put themselves in front of what the screens are waiting for
+  // (#50). Nobody swipes to the next lyrics in the first five seconds. While
+  // backgrounded nobody swipes at all: the card fetches on demand when it is
+  // shown, so nothing is lost by skipping the warm-up.
+  if (!bootQuiet && AppState.currentState === 'active') prefetchLyrics(song);
+  publishAnimatedClip(song);
+  if (nextLyricsTimer) clearTimeout(nextLyricsTimer);
+  nextLyricsTimer = setTimeout(() => {
+    if (AppState.currentState !== 'active') return;
+    const { queue, index } = usePlayerStore.getState();
+    if (queue.length > 1) prefetchLyrics(queue[(index + 1) % queue.length]);
+  }, NEXT_LYRICS_DELAY_MS);
+  scheduleSync();
+  warmUpcoming();
+  useSongCache.getState().touch(song.id);
+  cacheUpcoming();
+  // The mix only grows when the queue is running out under somebody who is
+  // listening, and asking the server for it is not work for the cold start.
+  if (!bootQuiet) void maybeQueueAutoplay();
+  // Casting: reflect the new track in the media session (lock/volume).
+  syncCastMedia();
+}
+
+// ── Song cache (#180) ─────────────────────────────────────────────────────────
+
+/**
+ * Asks the cache for the next song and the one playing, in that order: the
+ * next one fetched ahead plays from the phone instead of being streamed.
+ */
+function cacheUpcoming() {
+  if (bootQuiet || !useSettings.getState().songCache) return;
+  const { auth, offline } = useAuthStore.getState();
+  // A renderer fetches from the server itself; nothing plays on the phone.
+  if (!auth || offline || remoteKind()) return;
+  const st = usePlayerStore.getState();
+  const current = st.queue[st.index];
+  if (!current) return;
+  const ni = nextIndex(false);
+  const next = ni == null ? undefined : st.queue[ni];
+  const songs = next && next.id !== current.id ? [next, current] : [current];
+  useSongCache.getState().want(songs, streamTargetFor);
+}
+
+// The next track may already sit in the native player as a stream: once its
+// copy lands it is queued again, from the phone.
+useSongCache.subscribe((s, prev) => {
+  const id = queuedNext?.id;
+  if (!id || s.entries === prev.entries) return;
+  if (s.entries[id] && !prev.entries[id]) scheduleNextSource(true);
+});
+
+// ── Preload upcoming tracks (warms up the stream in advance) ──────────────────
+// For proxies like Octo Fiesta that fetch the track on demand: asking for the
+// next few in advance leaves them cached before playback arrives. Off by
+// default; a normal server only gets extra transcodes out of it.
+//
+// Reaching the server is not enough. The request has to be held open until it
+// answers, or Octo Fiesta cancels the download and throws away what it wrote
+// (see `WARM_TIMEOUT_MS`).
+//
+// And the window also moves when a song is put next, not only on a track
+// change: warming only on the change left the song somebody had just asked for
+// as the one nobody warmed (#137). The queue is watched for that at the bottom
+// of this file.
+const PRELOAD_AHEAD = 5;
+/** Already-warmed ids: as the window slides only the new one entering is warmed
+ *  (~1 request per advance), not all five each time. Cleared on queue change
+ *  (playQueue). */
+const warmedIds = new Set<string>();
+/** Raised when a queue replaces another: what the last one still had to warm is
+ *  nobody's now, and each would hold the proxy for up to two minutes. */
+let warmWalk = 0;
+/** The warm on its way, hung up on when its queue goes away. */
+let warmInFlight: AbortController | null = null;
+
+function resetWarmed() {
+  warmedIds.clear();
+  warmWalk++;
+  warmInFlight?.abort();
+}
+
+function warmUpcoming() {
+  if (bootQuiet) return; // see the boot window: nothing speculative on the way in
+  if (!useSettings.getState().preloadUpcoming) return;
+  const auth = useAuthStore.getState().auth;
+  if (!auth || useAuthStore.getState().offline) return;
+  const { queue, index, repeat } = usePlayerStore.getState();
+  if (queue.length <= 1) return;
+  for (let i = 1; i <= PRELOAD_AHEAD; i++) {
+    // 'one' doesn't change tracks; with 'all' the queue wraps around, if not cut.
+    const ni = repeat === 'all' ? (index + i) % queue.length : index + i;
+    if (repeat !== 'all' && ni >= queue.length) break;
+    const song = queue[ni];
+    // What plays from disk, and radio, don't go through the server: nothing
+    // to warm.
+    if (!song || song.url || localSourceFor(song)) continue;
+    if (warmedIds.has(song.id)) continue;
+    warmedIds.add(song.id);
+    // Without `maxBitRate`: we warm the ORIGIN, not the transcoding. On an
+    // Octo Fiesta-like proxy this still triggers the provider download (which is
+    // the slow part), but does NOT lock in the transcoded session that playback
+    // later uses, thus preserving seek (with the identical stream URL, that
+    // first request would make it non-seekable and dragging would restart the
+    // track). On a normal server, it also avoids extra transcodes.
+    warmStream(song.id, streamUrl(auth, song.id));
+  }
+}
+
+/**
+ * How long a warm may sit waiting for the first byte. It used to be four
+ * seconds, which is what made all of this do nothing on the proxy it was
+ * written for (#137): Octo Fiesta's `/rest/stream` only answers once it has
+ * pulled the whole track from the provider, and it hands the download the
+ * request's own cancellation token. Hanging up at four seconds cancelled the
+ * download and deleted the half-written file, so nothing was cached and the
+ * track was fetched from scratch when playback reached it. Waiting costs
+ * nothing: until those headers arrive the server has sent no bytes.
+ */
+const WARM_TIMEOUT_MS = 120_000;
+
+/**
+ * Single warming point, and only one at a time.
+ *
+ * The request is what matters, not the answer: on a proxy that fetches from a
+ * provider, being asked for the track is what makes it go and get it. `Range`
+ * keeps the reply to two bytes on a server that honours it, and the body is
+ * never read on any server, so this stays cheap in data however long it waits.
+ *
+ * Serial because of what waiting means now. The phone holds a handful of
+ * connections to the server at once, and five speculative requests each able
+ * to hold one for two minutes would sit in front of the covers and the lists
+ * the screens are waiting for, which is the very thing #50 was about. One at a
+ * time, in window order, so the song coming next is the one warming.
+ */
+let warmChain: Promise<void> = Promise.resolve();
+
+function warmStream(id: string, url: string) {
+  const walk = warmWalk;
+  warmChain = warmChain.then(() => warmRequest(id, url, walk));
+}
+
+async function warmRequest(id: string, url: string, walk: number) {
+  await speculationOpen();
+  if (walk !== warmWalk) return;
+  // Reached by a skip while it waited: the player is already asking for it.
+  if (currentSong(usePlayerStore.getState())?.id === id) return;
+  // Nothing is warmed offline: there is no stream to fetch, and the request
+  // would be one more thing reaching the network behind someone's back.
+  if (useAuthStore.getState().offline) return;
+  bump('preload · asked the server');
+  const ctrl = new AbortController();
+  warmInFlight = ctrl;
+  const timer = setTimeout(() => ctrl.abort(), WARM_TIMEOUT_MS);
+  try {
+    // `expoFetch`, not the global one: this runs while a song is playing, which
+    // is exactly when the app is in the background and React Native's stops
+    // answering. See the note in `src/api/subsonic.ts`.
+    await expoFetch(url, { headers: { Range: 'bytes=0-1' }, signal: ctrl.signal });
+    // Headers back: whatever the server had to do to have this track ready is
+    // done, and the file it wrote outlives the connection. `expo/fetch` hands
+    // the body over as a stream nobody reads, so hanging up here is what keeps
+    // a server that ignores `Range` from streaming a whole track at us.
+    ctrl.abort();
+    bump('preload · server ready');
+  } catch {
+    // Best-effort, but not forgotten: a warm that timed out left the server
+    // with nothing cached (it deletes what it had half-written), so the id goes
+    // back in the hat and the next time the window moves it is tried again.
+    bump('preload · no answer');
+    warmedIds.delete(id);
+  } finally {
+    clearTimeout(timer);
+    warmInFlight = null;
+  }
+}
+
+// ── Autoplay: when nearing the end of the queue, enqueue similar songs ──────
+// (Spotify-like). Online only, with the setting enabled (or in radio mode) and
+// without repeating request for the same last song.
+let autoplayFetchedFor: string | null = null;
+/**
+ * The round that is fetching right now, so a second caller waits for it instead
+ * of being told there is nothing.
+ *
+ * Starting a mix asks twice within the same tick: loading the seed sends the
+ * track-change round off on its own, and `startRadio` then asks again so it can
+ * report whether anything was found. The second used to see the tail already
+ * marked and return empty-handed, `startRadio` measured a queue of one, and the
+ * app said it had found nothing to mix with while the first round was still in
+ * the air. The mix then filled in a moment later, which is what made the
+ * message so obviously wrong to anybody reading it.
+ */
+let autoplayRound: Promise<void> | null = null;
+/** Rounds that came back empty for the same tail, and the timed retry after
+ *  each (see `maybeQueueAutoplay`). */
+let autoplayRetry: { tail: string; tries: number } | null = null;
+const AUTOPLAY_RETRIES = 3;
+const AUTOPLAY_RETRY_MS = 30_000;
+
+/** Songs by the same artist that fit in one batch: what keeps a mix from
+ *  turning into that artist's discography. */
+const MAX_PER_ARTIST = 2;
+/** Similar artists explored per batch, and songs taken from each. */
+const SIMILAR_ARTISTS = 4;
+const SONGS_PER_SIMILAR_ARTIST = 5;
+/** Songs a batch aims for (the queue is then extended by up to 10). */
+const BATCH_SIZE = 12;
+
+/**
+ * Top songs by artists similar to the seed's. This is the tier that actually
+ * gives a mix its range: everything else either stays on the seed's artist or
+ * falls back to a whole genre.
+ *
+ * The similar-artist list is cached per seed because with a fixed seed (see
+ * `radioSeed`) it's the same every batch and it costs a request. Servers
+ * without a Last.fm agent answer nothing here, which is why the mix still needs
+ * the fallback tiers below.
+ */
+let similarArtistsCache: { seedId: string; names: string[] } | null = null;
+
+async function similarArtistCandidates(auth: SubsonicAuth, seed: Song): Promise<Song[]> {
+  if (!seed.artistId) return [];
+  if (similarArtistsCache?.seedId !== seed.id) {
+    const info = await getArtistInfo(auth, seed.artistId);
+    similarArtistsCache = { seedId: seed.id, names: info.similarArtists.map((a) => a.name) };
+  }
+  // Shuffled, not the top N: over a long mix this walks the whole list instead
+  // of hammering the same four artists batch after batch.
+  const names = dealt(similarArtistsCache.names).slice(0, SIMILAR_ARTISTS);
+  const lists = await Promise.all(
+    names.map((n) => getTopSongs(auth, n, SONGS_PER_SIMILAR_ARTIST).catch(() => [] as Song[])),
+  );
+  return lists.flat();
+}
+
+/**
+ * Random songs from the seed's genre. When the track carries no genre tag, the
+ * one its album siblings carry: tags live per file, so an untagged track can
+ * perfectly well sit inside an otherwise tagged album. Empty if neither has one.
+ */
+async function genreCandidates(auth: SubsonicAuth, seed: Song): Promise<Song[]> {
+  let genre = seed.genre;
+  if (!genre && seed.albumId) {
+    const { songs } = await getAlbum(auth, seed.albumId);
+    genre = songs.find((s) => s.genre)?.genre;
+  }
+  return genre ? getRandomSongs(20, genre) : [];
+}
+
+/**
+ * Songs to extend a radio from `seed`.
+ *
+ * The three affinity sources are asked at once into a single pool, shuffled and
+ * capped at `MAX_PER_ARTIST`: taking the first non-empty tier whole filled the
+ * batch with twenty consecutive tracks by one artist. Genre and random only top
+ * up what affinity left, and they are the safety net, since on Navidrome the
+ * affinity tiers all go through Last.fm.
+ *
+ * Only the random tiers honour the library filter, because only `getRandomSongs`
+ * takes a folder and a song does not say which library it came from (#39).
+ */
+async function radioCandidates(auth: SubsonicAuth, seed: Song, have: Set<string>): Promise<Song[]> {
+  const picked: Song[] = [];
+  const seen = new Set(have);
+  const perArtist = new Map<string, number>();
+
+  /** Adds what fits from a pool, in random order and respecting the cap. */
+  const take = (songs: Song[]) => {
+    for (const s of dealt(songs)) {
+      if (picked.length >= BATCH_SIZE) return;
+      if (s.url || seen.has(s.id)) continue;
+      const artist = s.artistId ?? s.artist ?? '';
+      const n = perArtist.get(artist) ?? 0;
+      if (n >= MAX_PER_ARTIST) continue;
+      perArtist.set(artist, n + 1);
+      seen.add(s.id);
+      picked.push(s);
+    }
+  };
+
+  const affinity = await Promise.all([
+    getSimilarSongs(auth, seed.id, 30).catch(() => [] as Song[]),
+    similarArtistCandidates(auth, seed).catch(() => [] as Song[]),
+    seed.artist
+      ? getTopSongs(auth, seed.artist, 20).catch(() => [] as Song[])
+      : Promise.resolve([] as Song[]),
+  ]);
+  take(affinity.flat());
+
+  for (const tier of [() => genreCandidates(auth, seed), () => getRandomSongs(50)]) {
+    if (picked.length >= BATCH_SIZE) break;
+    try {
+      take(await tier());
+    } catch {
+      continue; // this tier failed; the next one might work
+    }
+  }
+  if (picked.length > 0) return picked;
+
+  // Nothing at all: on a library small or homogeneous enough, the per-artist
+  // cap can eat every candidate there was. A batch by one artist beats the mix
+  // going silent.
+  const anything = await getRandomSongs(50).catch(() => [] as Song[]);
+  return anything.filter((s) => !s.url && !have.has(s.id)).slice(0, BATCH_SIZE);
+}
+
+// ── The rest of the artist ─────────────────────────────────────────────────
+// A queue started from an artist screen holds their popular tracks, and those
+// run out. What follows used to be either silence or a mix of other people,
+// neither of which is what someone pressing play on an artist asked for (#79),
+// so their own catalogue goes first: album by album, oldest on, and only once
+// that is exhausted does the mix get its turn.
+
+/** Albums still to be handed over, for the artist queue being played. */
+let artistFill: { href: string; albums: Album[]; next: number } | null = null;
+
+/** The artist a queue came from, or null if it came from anywhere else. */
+function artistOfQueue(sourceHref: string | null): string | null {
+  const match = sourceHref?.match(/^\/artist\/([^/]+)$/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Adds the artist's next album to the queue. True if it added anything, which
+ * is the caller's cue to leave the mix alone for now.
+ *
+ * One album per turn on purpose: this runs when the queue is two songs from
+ * the end, so an album buys another twenty minutes and the next one is fetched
+ * in that time. Pulling the whole discography at once is dozens of requests for
+ * someone who may well stop after the popular tracks (#50).
+ */
+async function extendWithArtistCatalog(auth: SubsonicAuth, artistId: string, href: string) {
+  if (artistFill?.href !== href) {
+    const { albums } = await getArtist(auth, artistId);
+    // Oldest first, like "Play discography": once the popular tracks are done,
+    // what follows is the artist's story in order.
+    artistFill = {
+      href,
+      albums: [...albums].sort((a, b) => (a.year ?? Infinity) - (b.year ?? Infinity)),
+      next: 0,
+    };
+  }
+  const fill = artistFill;
+  while (fill.next < fill.albums.length) {
+    const album = fill.albums[fill.next];
+    // Moved past only once it has answered: one that failed to load is asked
+    // for again next time, instead of dropping out of the artist's story.
+    const { songs } = await getAlbum(auth, album.id);
+    fill.next += 1;
+    const st = usePlayerStore.getState();
+    // The queue may have moved on while the server answered.
+    if (st.sourceHref !== href) return false;
+    const have = new Set(st.queue.map((s) => s.id));
+    const fresh = songs.filter((s) => !have.has(s.id) && !s.url);
+    // Nothing new: the album was already in the queue (it came from "Play
+    // discography", or its songs are the popular ones). On to the next.
+    if (fresh.length === 0) continue;
+    usePlayerStore.setState({ queue: [...st.queue, ...fresh] });
+    scheduleSync();
+    return true;
+  }
+  return false;
+}
+
+/** The Home radio a queue came from, or null if it came from anywhere else. */
+function radioOfQueue(sourceHref: string | null): string | null {
+  const match = sourceHref?.match(/^\/artist-radio\/([^/]+)$/);
+  return match ? match[1] : null;
+}
+
+/** The round of a radio under way, by the queue's tail it was asked for. */
+let radioRound: { tail: string; done: Promise<boolean> } | null = null;
+
+/**
+ * Adds another round of the radio the queue came from. A radio does not end
+ * at its thirty songs: it draws again from the same artists, the same way,
+ * leaving out what was already played. True if it added anything.
+ */
+function extendWithRadio(radioId: string, href: string, tail: string): Promise<boolean> {
+  if (radioRound?.tail === tail) return radioRound.done;
+  const done = (async () => {
+    const have = new Set(usePlayerStore.getState().queue.map((s) => s.id));
+    const more = await moreRadioTracks(radioId, have);
+    const st = usePlayerStore.getState();
+    // The queue may have moved on while the server answered.
+    if (!more || more.length === 0 || st.sourceHref !== href) return false;
+    const inQueue = new Set(st.queue.map((s) => s.id));
+    const fresh = more.filter((s) => !inQueue.has(s.id) && !s.url);
+    if (fresh.length === 0) return false;
+    // The seam: the round opens on the seed, which may be who just played.
+    const lastArtist = st.queue[st.queue.length - 1]?.artistId;
+    if (fresh.length > 1 && fresh[0].artistId && fresh[0].artistId === lastArtist) {
+      fresh.push(fresh.shift()!);
+    }
+    usePlayerStore.setState({ queue: [...st.queue, ...fresh] });
+    scheduleSync();
+    return true;
+  })();
+  radioRound = { tail, done };
+  return done;
+}
+
+async function maybeQueueAutoplay() {
+  const { queue, index, repeat, radioMode, radioSeed, sourceHref } = usePlayerStore.getState();
+  // With repeat the queue never "runs out", so plain autoplay has no end to
+  // extend past; and if 2+ songs remain, not yet.
+  //
+  // A mix is not that. It was started by hand and the whole point of it is that
+  // it keeps arriving, so repeat does not get to stop it. Letting it was how
+  // "Start mix" came back "Couldn't find anything to mix with this song" for
+  // every song on any account that had left repeat on (#197): the report said
+  // nothing was found, and nothing had been looked for, because this line
+  // returned before a single request went out.
+  if ((repeat !== 'off' && !radioMode) || index < queue.length - 2) return;
+  const { auth, offline } = useAuthStore.getState();
+  if (!auth || offline) return;
+  // Before the mix, and before the autoplay setting has a say: this is not
+  // similar music, it is the artist that was asked for. A mix is left alone,
+  // since there the drift is the whole point.
+  const { radiosEnabled, radioEndless } = useSettings.getState();
+  const radioId =
+    radioMode || !radiosEnabled || !radioEndless ? null : radioOfQueue(sourceHref);
+  const tail = queue[queue.length - 1];
+  if (radioId && tail) {
+    try {
+      if (await extendWithRadio(radioId, sourceHref!, tail.id)) return;
+    } catch {
+      // The radio cannot be drawn again; the mix below is still worth a try.
+    }
+  }
+  const artistId = radioMode ? null : artistOfQueue(sourceHref);
+  if (artistId) {
+    try {
+      if (await extendWithArtistCatalog(auth, artistId, sourceHref!)) return;
+    } catch {
+      // The catalogue is unreachable; the mix below is still worth a try.
+    }
+  }
+  // Radio extends even if autoplay is off: you started it manually.
+  if (!useSettings.getState().autoplaySimilar && !radioMode) return;
+  const last = queue[queue.length - 1];
+  if (!last || last.url) return;
+  // Already asked for this tail: if that round is still going, its answer is
+  // the answer, so wait for it rather than reporting nothing.
+  if (autoplayFetchedFor === last.id) return autoplayRound ?? undefined;
+  autoplayFetchedFor = last.id;
+  autoplayRound = fetchAutoplay(auth, last, radioMode, radioSeed, queue).then((added) => {
+    // Came back with nothing, which a dropped connection looks just like: the
+    // tail is left unmarked so it is asked again. Marked for good, a second
+    // without signal at the wrong moment ended the mix for the rest of the
+    // session. A track change or the network coming back asks on its own; a
+    // short timer covers the queue that has no track left to change to, and
+    // stops after a few tries in case the answer really is empty.
+    if (added) {
+      autoplayRetry = null;
+      return;
+    }
+    if (autoplayFetchedFor !== last.id) return;
+    autoplayFetchedFor = null;
+    const tries = autoplayRetry?.tail === last.id ? autoplayRetry.tries + 1 : 1;
+    autoplayRetry = { tail: last.id, tries };
+    if (tries <= AUTOPLAY_RETRIES) {
+      setTimeout(() => {
+        const q = usePlayerStore.getState().queue;
+        if (q[q.length - 1]?.id === last.id) void maybeQueueAutoplay();
+      }, AUTOPLAY_RETRY_MS);
+    }
+  });
+  return autoplayRound;
+}
+
+/** One round of it: asks the server and appends what is worth appending.
+ *  True if anything was. */
+async function fetchAutoplay(
+  auth: SubsonicAuth,
+  last: Song,
+  radioMode: boolean,
+  radioSeed: Song | null,
+  queue: Song[],
+): Promise<boolean> {
+  // A mix always extends from the track it was started on. Seeding off the tail
+  // (which is what plain autoplay does, and rightly so) made every batch reseed
+  // on the previous batch's last track, so the mix drifted arbitrarily far from
+  // the song whose name the player was still showing.
+  const seed = radioMode ? (radioSeed ?? last) : last;
+  let similar: Song[];
+  try {
+    // The backup tiers (artist, genre) only in radio: normal autoplay
+    // behaves as before.
+    similar = radioMode
+      ? await radioCandidates(auth, seed, new Set([seed.id, ...queue.map((s) => s.id)]))
+      : await getSimilarSongs(auth, last.id, 20);
+  } catch {
+    return false; // without autoplay: playback will stop at the end, as before
+  }
+  const st = usePlayerStore.getState();
+  // The queue may have changed while the server was responding; we only add if
+  // the last song is still the same.
+  if (st.queue[st.queue.length - 1]?.id !== last.id) return false;
+  const have = new Set(st.queue.map((s) => s.id));
+  const picked = similar.filter((s) => !have.has(s.id) && !s.url).slice(0, 10);
+  if (picked.length === 0) return false;
+  // Marked so the player can stop announcing the album or the playlist once
+  // playback reaches them (`mixSeedOf`). Not in a radio: there the whole queue
+  // is the mix and it already says so, and marking would have the header work
+  // out a seed of its own instead of using the name the mix was started with.
+  const fresh = radioMode ? picked : picked.map((s) => ({ ...s, fromMix: true }));
+  usePlayerStore.setState({ queue: [...st.queue, ...fresh] });
+  scheduleSync();
+  return true;
+}
+
+/** Next index on end/skip; null if playback should stop. */
+function nextIndex(_manual: boolean): number | null {
+  const { queue, index, repeat } = usePlayerStore.getState();
+  // Offline, tracks without local file (stream-only) are skipped; online any is
+  // fine. `ok` decides if an index is a candidate.
+  const offline = useAuthStore.getState().offline;
+  return nextPlayable(queue, index, repeat, (i) => !offline || playableOffline(queue[i]));
+}
+
+// ── Gapless ─────────────────────────────────────────────────────────────────
+// Advancing on `didJustFinish` fetches the next track only once the previous
+// one has ended, and that connection is the gap (#8). Instead it is queued
+// inside the native player (`setNextSource`, in patches/expo-audio.patch),
+// which buffers it and joins them itself; the jump arrives as
+// `trackTransition` and JS only follows.
+//
+// The join is as tight as the format allows: with no transcoding, or
+// transcoding to Opus, the encoder padding is described in the file and gets
+// trimmed; an MP3 or AAC generated on the fly carries no such metadata, so a
+// few tens of milliseconds of encoder silence stay. The buffer gap, which is
+// the audible one, goes either way.
+
+/** Track queued in the native player, or null. The id travels along: the queue
+ *  can be reordered between queueing it and getting there. */
+let queuedNext: { index: number; id: string } | null = null;
+
+/**
+ * Point of entry for every source change. `replace()` installs a new media
+ * source and drops whatever was queued behind it, so the memo can't outlive it.
+ */
+function replaceSource(p: AudioPlayer, source: AudioSource) {
+  queuedNext = null;
+  p.replace(source);
+}
+
+/**
+ * Does queueing the next track make sense right now?
+ *
+ * Not a preference: nobody asks to have silence put back between their songs,
+ * so there is no setting for it. Crossfade is the one that turns it off, by
+ * taking the change over.
+ */
+function gaplessReady(): boolean {
+  const settings = useSettings.getState();
+  // Crossfade drives the advance itself, starting the next track early on the
+  // reserve player. Both cannot own the change.
+  if (settings.crossfadeSec > 0) return false;
+  if (remoteKind()) return false;
+  const st = usePlayerStore.getState();
+  // 'one' repeats through the native `loop`, and "stop at end of song" needs
+  // the track to end for real so its `didJustFinish` arrives.
+  if (st.repeat === 'one' || st.sleepAtSongEnd) return false;
+  const current = st.queue[st.index];
+  // A radio has no end to join anything to.
+  return !!current && !current.url;
+}
+
+/**
+ * Queues the track that comes next in the native player, or drops the queued
+ * one when it no longer applies. `force` re-queues even if it's the same track
+ * (its URL changed: bitrate, format).
+ */
+function scheduleNextSource(force = false) {
+  const st = usePlayerStore.getState();
+  // The covers of the tracks walking in behind this one: fetched and encoded
+  // while the current one still plays. The current track's own is in the
+  // window too (k = 0) - it is the one the lock screen shows first. Before
+  // the `activePlayer()` gate below on purpose: warming needs no player, and
+  // waiting for one left the covers of a cold start unwarmed until the first
+  // play. Gapless queues the next track natively (and warms its cover); this
+  // is the window behind it, and the whole walk under crossfade, which queues
+  // no track at all. With 'all' the window wraps to the queue's start.
+  for (let k = 0; k <= ARTWORK_LOOKAHEAD; k += 1) {
+    const ahead =
+      st.repeat === 'all' && st.queue.length > 0
+        ? st.queue[(st.index + k) % st.queue.length]
+        : st.queue[st.index + k];
+    if (ahead && !ahead.url) warmArtwork(ahead);
+  }
+  // Same window for the endpoint clips: the lock screen's tall one is already
+  // streaming while the track it belongs to is still the next one.
+  {
+    const endpoint = activeArtworkEndpoint(useSettings.getState());
+    if (endpoint && motionNetworkAllowed()) {
+      const customs = useSettings.getState().animatedArtworkUrls;
+      for (let k = 0; k <= ARTWORK_LOOKAHEAD; k += 1) {
+        const ahead =
+          st.repeat === 'all' && st.queue.length > 0
+            ? st.queue[(st.index + k) % st.queue.length]
+            : st.queue[st.index + k];
+        if (ahead && !ahead.url) {
+          prefetchAnimatedArtwork(
+            endpoint,
+            ahead,
+            customs[animatedArtworkKey(ahead.artist ?? '', ahead.album ?? '')],
+          );
+        }
+      }
+    }
+  }
+  const p = activePlayer();
+  if (!p) return;
+  // Repeating one song is the native `loop`, which a source holding only part
+  // of the song cannot do (see `applyLoop`). What comes after that source is
+  // the same song from the beginning: queued here, the player joins them by
+  // itself, so the track never ends. Letting it end instead worked, but the
+  // notification showed the end of the song for the instant it took to ask for
+  // it again, and the silence of that request was audible.
+  // Not with "stop at end of song" pending: that one waits for the track to
+  // end for real, and joining another source behind it means it never does.
+  const restartSelf =
+    st.repeat === 'one' && streamOffsetSec > 0 && !st.sleepAtSongEnd && !remoteKind();
+  const ni = restartSelf ? st.index : gaplessReady() ? nextIndex(false) : null;
+  const next = ni == null ? null : st.queue[ni];
+  if (ni == null || !next || next.url) {
+    if (queuedNext) {
+      queuedNext = null;
+      try {
+        p.clearNextSource();
+      } catch {
+        // ignore
+      }
+    }
+    return;
+  }
+  // `force` re-queues the same track anyway: same song, different URL.
+  if (!force && queuedNext && queuedNext.index === ni && queuedNext.id === next.id) return;
+  try {
+    p.setNextSource(sourceFor(next));
+    queuedNext = { index: ni, id: next.id };
+  } catch {
+    queuedNext = null;
+  }
+}
+
+/**
+ * The player moved on by itself to the queued track. Nothing is loaded here:
+ * it's already playing. This is the same bookkeeping `loadIndex` does around
+ * its `replace()`, without the replace.
+ */
+function onTrackTransition() {
+  const queued = queuedNext;
+  queuedNext = null;
+  const p = activePlayer();
+  // The player moved to a track JS had already forgotten queueing. Nothing here
+  // can fix it —there is no telling which song it went to— but it is worth
+  // counting: from this moment the store, the notification and the car are all
+  // describing the track before the one being heard, which is what a cover from
+  // a neighbouring song looks like from the outside.
+  if (!queued) bump('player · transition with no memo');
+  if (!queued || !p) return;
+  const st = usePlayerStore.getState();
+  // Follow the song, not the position: the queue may have been reordered while
+  // it was waiting its turn.
+  let index = queued.index;
+  if (st.queue[index]?.id !== queued.id) {
+    index = st.queue.findIndex((s) => s.id === queued.id);
+    // It was removed from the queue while playing: there's no index to move to,
+    // so the state stays put and the track end takes the normal path.
+    if (index === -1) {
+      bump('player · transition to a song no longer queued');
+      return;
+    }
+  }
+  const song = st.queue[index];
+  // A song repeating itself is not something to walk back to: ⏮️ would have
+  // spent one press per lap on the song already playing.
+  if (index !== st.index) pushHistory();
+  consumeQueuedOnIndexChange(index);
+  pendingSeek = null;
+  setStreamOffset(0, p);
+  // Whole song again: from here the repeat is the native `loop`, and nothing
+  // else needs queueing behind it.
+  applyLoop(p);
+  sourceHasLength = null; // another source: unknown until it reports
+  resetListen();
+  // ReplayGain is per song. Not mid-ramp (sleep fade, pause fade): setting the
+  // volume here would undo it.
+  if (!sleepFadeTimer && !pauseFadeTimer) p.volume = effectiveVolume(song);
+  // The same player carries on with the rate it had, which is right for
+  // anything gapless queues (never a station) and puts it back to 1 if this
+  // song turns out to be one.
+  applySpeed(p, song);
+  usePlayerStore.setState({
+    index,
+    positionSec: 0,
+    durationSec: song.duration ?? 0,
+    isPlaying: true,
+    isBuffering: false,
+  });
+  applyLockScreen(p, song);
+  onTrackChanged(song);
+  resumeEpisodeAfterMove(song);
+  if (!song.url && !localSourceFor(song)) void ensureTranscodeOffsetSupport();
+  scheduleNextSource();
+}
+
+// Crossfade on/off decides who owns the advance, and the stream URL of the
+// queued track depends on format and bitrate: all of them have to re-evaluate
+// what is (or is no longer) waiting behind the current track.
+const gaplessSettingsKey = (s: ReturnType<typeof useSettings.getState>) =>
+  `${s.crossfadeSec}|${s.streamFormat}|${s.streamFormatCellular}|${s.maxBitRate}|${s.maxBitRateCellular}|${s.streamLosslessOnly}`;
+let lastGaplessSettings = gaplessSettingsKey(useSettings.getState());
+useSettings.subscribe((s) => {
+  const key = gaplessSettingsKey(s);
+  if (key === lastGaplessSettings) return;
+  lastGaplessSettings = key;
+  scheduleNextSource(true);
+});
+
+// ── ReplayGain (volume normalization) ────────────────────────────────────────
+// A player's effective volume is always `volume` (the user's) times the
+// ReplayGain factor of ITS song. Tags come from the server (and are
+// preserved in downloads); without tags or with the setting off, 1.
+
+/** Linear ReplayGain factor for a song according to the setting mode. */
+function gainFactor(song: Song | null | undefined): number {
+  const settings = useSettings.getState();
+  let mode = settings.replayGain;
+  const rg = song?.replayGain;
+  if (mode === 'off' || !rg) return 1;
+  if (mode === 'auto') {
+    // Like Spotify: whole album without shuffle → album gain (preserves
+    // its internal dynamics); playlists, favorites or shuffle → per track.
+    const st = usePlayerStore.getState();
+    mode = st.sourceHref?.startsWith('/album/') && !st.shuffle ? 'album' : 'track';
+  }
+  // Album mode without album gain (or vice versa): use whatever is available.
+  const gain = mode === 'album' ? (rg.albumGain ?? rg.trackGain) : (rg.trackGain ?? rg.albumGain);
+  if (typeof gain !== 'number' || !Number.isFinite(gain)) return 1;
+  // The pre-amp rides on top of the tag: it moves the target loudness the whole
+  // library normalizes to, which is the point of having one (#93).
+  let f = Math.pow(10, (gain + settings.replayGainPreampDb) / 20);
+  // With positive gain, don't exceed the file's peak (prevents clipping).
+  const peak = mode === 'album' ? (rg.albumPeak ?? rg.trackPeak) : (rg.trackPeak ?? rg.albumPeak);
+  if (typeof peak === 'number' && peak > 0) f = Math.min(f, 1 / peak);
+  // Safety clamp for wild tags.
+  return Math.min(Math.max(f, 0.05), 4);
+}
+
+/** Effective volume (user × ReplayGain) for the given song. */
+function effectiveVolume(song: Song | null | undefined): number {
+  return usePlayerStore.getState().volume * gainFactor(song);
+}
+
+// When the mode or the pre-amp changes in Settings, re-apply the volume of the
+// currently playing track (outside ramps: an in-progress fade only converges to
+// the new value).
+const replayGainKey = (s: ReturnType<typeof useSettings.getState>) =>
+  `${s.replayGain}|${s.replayGainPreampDb}`;
+let lastReplayGain = replayGainKey(useSettings.getState());
+useSettings.subscribe((s) => {
+  if (replayGainKey(s) === lastReplayGain) return;
+  lastReplayGain = replayGainKey(s);
+  if (fadingOut || pauseFadeTimer) return;
+  const p = activePlayer();
+  if (p) p.volume = effectiveVolume(currentSong(usePlayerStore.getState()));
+});
+
+// ── Playback speed ──────────────────────────────────────────────────────────
+// Playing along with a record on an instrument is the reason this exists
+// (#151), so the pitch does not move with the speed: media3 stretches time
+// (`shouldCorrectPitch`, which expo-audio has on by default) and a song slowed
+// to three quarters is still in its own key. Varispeed (#277) is the other
+// way, asked for by name: the pitch goes with it, like a tape.
+//
+// It is a property of the player and not of the source, so every place that
+// installs a source applies it: a `replace()` keeps whatever rate the player
+// was running at, but the reserve player of a crossfade or a handoff is
+// another player, and it starts at 1.
+
+/** The speeds offered, in order. 1 is the normal one, and the default. */
+export const PLAYBACK_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
+
+/**
+ * Rate a song should actually run at.
+ *
+ * A station arrives in real time: asking for it faster only drains the buffer
+ * it is being fed and it stalls, so it always plays at 1. The choice is kept
+ * either way and comes back with the next track that has a file behind it.
+ */
+function speedFor(song: Song | null | undefined): number {
+  if (!song) return 1;
+  // A station stalls if hurried; a podcast episode (`vod`) is a file and can.
+  if (song.url && !song.vod) return 1;
+  return usePlayerStore.getState().speed;
+}
+
+/** The speed a saved queue carries, within what `setSpeed` allows. */
+function savedSpeed(saved: StoredQueue): { speed: number; varispeed: boolean } {
+  const v = saved.speed;
+  const speed = typeof v === 'number' && Number.isFinite(v) ? Math.min(2, Math.max(0.5, v)) : 1;
+  return { speed, varispeed: saved.varispeed === true };
+}
+
+/** Applies the speed of `song` to the player holding it. */
+function applySpeed(p: AudioPlayer | null, song: Song | null | undefined) {
+  if (!p) return;
+  try {
+    // Before the rate, not after: the pitch is worked out when the rate is
+    // set, so a player told to correct it afterwards keeps the old parameters.
+    // Varispeed is the one case that lets the pitch follow the rate.
+    p.shouldCorrectPitch = !usePlayerStore.getState().varispeed;
+    p.setPlaybackRate(speedFor(song));
+  } catch {
+    // ignore
+  }
+}
+
+// ── Crossfade ───────────────────────────────────────────────────────────────
+// When nearing the end of the track, the next one starts on the reserve player
+// at volume 0 and both volumes cross (equal power curve).
+// The incoming player becomes the active one from the first instant: state,
+// notification and scrobble change when the fade starts, like Spotify.
+
+let fadeTimer: ReturnType<typeof setInterval> | null = null;
+/** Outgoing player while a fade is in progress. */
+let fadingOut: AudioPlayer | null = null;
+/**
+ * Data of the in-progress crossfade (null if none). Progress is calculated by
+ * wall clock (`t0`), so it doesn't matter who drives it: the foreground
+ * smooth `setInterval` or the `onStatus` heartbeat. The latter is what fixes
+ * crossfade in the background: Android freezes setIntervals on minimize, but
+ * the native `playbackStatusUpdate` keeps beating, so the volume ramp still
+ * advances and the incoming track doesn't stay silent at volume 0.
+ */
+let fadeState: {
+  incoming: AudioPlayer;
+  t0: number;
+  fadeSec: number;
+  outGain: number;
+  inGain: number;
+} | null = null;
+
+/**
+ * Aborts the in-progress fade, if any: silences and stops the outgoing and
+ * leaves the active one at normal volume. Called on any intervention (manual
+ * track change, seek, pause, reset, remote output…) so the rest of the
+ * engine operates as if there were no crossfade.
+ */
+function cutCrossfade() {
+  // An in-progress server handoff also uses the reserve player and is also
+  // an operation that any intervention (track change, seek, pause,
+  // reset…) must abort: goes through here, which is the common path.
+  cancelHandoff();
+  if (fadeTimer) {
+    clearInterval(fadeTimer);
+    fadeTimer = null;
+  }
+  fadeState = null;
+  if (pauseFadeTimer) {
+    clearInterval(pauseFadeTimer);
+    pauseFadeTimer = null;
+  }
+  // And where that ramp was headed, which is the half that was being left
+  // behind. `settleFade` finishes whatever is still noted here the next time
+  // the app goes to the background, so a ramp this call abandoned came back
+  // minutes later and landed on whatever was playing by then: the volume put
+  // to zero, and if it had been a pause, the pause with it. What an
+  // intervention cancels does not get to happen afterwards.
+  pendingFade = null;
+  // The sleep fade is also an in-progress ramp: if the user touches anything
+  // (pause, seek, track change) it must be released, or it would keep lowering
+  // the volume of whatever plays now. The expiry still stands and `onStatus`
+  // re-arms it if still within the window.
+  clearSleepFade();
+  const volume = usePlayerStore.getState().volume;
+  if (fadingOut) {
+    try {
+      fadingOut.pause();
+      fadingOut.volume = volume;
+    } catch {
+      // ignore
+    }
+    fadingOut = null;
+  }
+  const p = activePlayer();
+  if (p) p.volume = effectiveVolume(currentSong(usePlayerStore.getState()));
+}
+
+// ── Seamless server handoff ──────────────────────────────────────────────────
+// On a server switch the playing track points at the old host, which may be
+// dead. Reloading it on the active player leaves an audible hole while the new
+// host buffers, so the new stream starts on the reserve player at volume 0,
+// and once it is really playing it is aligned with the old position and takes
+// over. No fade on purpose: it's the same song, and crossing two nearly equal
+// positions would cause phase issues.
+//
+// It's driven by the NATIVE event of the reserve player itself (not a timer), so
+// it survives background, which is where the automatic switch happens. It's
+// aborted by `cutCrossfade` (track change, seek, pause, reset…) and, if the new
+// host doesn't start on time, falls back to abrupt reload: never worse than before.
+let handoffToken = 0;
+let handoffReserve: AudioPlayer | null = null;
+let handoffSub: { remove: () => void } | null = null;
+
+/** Aborts an in-progress handoff and releases the reserve player. */
+function cancelHandoff() {
+  if (!handoffSub && !handoffReserve) return;
+  handoffToken++;
+  if (handoffSub) {
+    try {
+      handoffSub.remove();
+    } catch {
+      // ignore
+    }
+    handoffSub = null;
+  }
+  if (handoffReserve) {
+    try {
+      handoffReserve.pause();
+      handoffReserve.volume = usePlayerStore.getState().volume;
+    } catch {
+      // ignore
+    }
+    handoffReserve = null;
+  }
+}
+
+/** Reloads the current track abruptly against the active URL and returns to its
+ *  position (classic behavior; handoff fallback and the path for paused case). */
+function hardReload(index: number, sec: number, autoplay: boolean) {
+  void (async () => {
+    await loadIndex(index, autoplay);
+    if (sec > 0) seekActive(sec);
+  })();
+}
+
+/** Seamless handoff of the current track to the active host (see block above). */
+function handoffToNewSource(index: number, song: Song, sec: number) {
+  cutCrossfade(); // releases the reserve player and cancels any previous handoff
+  const oldP = activePlayer();
+  if (!oldP) {
+    hardReload(index, sec, true);
+    return;
+  }
+  // With transcoded stream and timeOffset support, the new one starts right at
+  // `sec` (native seek doesn't work on a real-time transcode). If not, from 0
+  // and we seek: normal random access.
+  const useOffset = needsOffsetSeek(song) && transcodeOffsetSupported === true;
+  const startAt = useOffset ? sec : 0;
+  const r = ensurePlayer(1 - activeIdx);
+  const token = ++handoffToken;
+  handoffReserve = r;
+  try {
+    replaceSource(r, sourceFor(song, startAt));
+    applyLoop(r, startAt);
+    applySpeed(r, song);
+    r.volume = 0; // inaudible until the switch; the old one keeps playing from its buffer
+    r.play();
+    if (!useOffset && sec > 0) r.seekTo(sec);
+  } catch {
+    handoffReserve = null;
+    hardReload(index, sec, true);
+    return;
+  }
+  let ticks = 0;
+  let aligned = false;
+  handoffSub = r.addListener('playbackStatusUpdate', (st: AudioStatus) => {
+    if (token !== handoffToken) return; // already canceled
+    ticks += 1;
+    const ready = st.playing && st.isLoaded && !st.isBuffering && (st.currentTime ?? 0) > 0;
+    if (!ready) {
+      // ~6 s (12 ticks of 500 ms): the new host doesn't start → abrupt reload.
+      if (ticks > 12) {
+        cancelHandoff();
+        hardReload(index, sec, true);
+      }
+      return;
+    }
+    // First instant the new one is playing: bring it to where the old one is NOW
+    // (it advanced while loading) and wait one tick for it to arrive, to avoid
+    // repeating or skipping audio. With offset the start already matches: no re-request.
+    if (!aligned && !useOffset) {
+      aligned = true;
+      try {
+        r.seekTo(oldP.currentTime ?? sec);
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    // Ready and aligned: instant switch. First flip the active so the new one
+    // already feeds state; this way the old one's pause (which emits
+    // playing=false) is ignored and the play button doesn't flicker.
+    handoffSub?.remove();
+    handoffSub = null;
+    handoffReserve = null;
+    handoffToken += 1;
+    try {
+      r.volume = effectiveVolume(song);
+    } catch {
+      // ignore
+    }
+    activeIdx = 1 - activeIdx;
+    setStreamOffset(useOffset ? startAt : 0, r);
+    try {
+      oldP.pause();
+      oldP.volume = usePlayerStore.getState().volume;
+    } catch {
+      // ignore
+    }
+    usePlayerStore.setState({ isBuffering: false });
+    applyLockScreen(r, song);
+  });
+}
+
+/** If it's time (setting active and ≤ N seconds left), starts the crossfade. */
+function maybeStartCrossfade(status: AudioStatus) {
+  const fadeSec = useSettings.getState().crossfadeSec;
+  // `handoffReserve`: a server handoff is using the reserve player.
+  if (fadeSec <= 0 || fadingOut || handoffReserve || !status.playing) return;
+  const st = usePlayerStore.getState();
+  // Same cases excluded by normal advance, plus those with no predictable end
+  // (radio) or where a fade makes no sense (very short tracks).
+  if (st.repeat === 'one' || st.sleepAtSongEnd) return;
+  // Nor during sleep fade: two ramps on the same volume, and the crossfade
+  // would start the incoming at full volume on the way to silence.
+  if (sleepFadeTimer) return;
+  const current = st.queue[st.index];
+  const duration = st.durationSec;
+  if (!current || current.url || duration < fadeSec + 5) return;
+  // What is left of the track measured in seconds of clock, which is what the
+  // fade is made of: at 1.5× the last nine seconds of music are six of ramp,
+  // and comparing the two straight started the fade while there was still a
+  // third of it left to play.
+  const remaining =
+    (duration - (streamOffsetSec + (status.currentTime ?? 0))) / speedFor(current);
+  if (remaining <= 0 || remaining > fadeSec) return;
+  const ni = nextIndex(false);
+  if (ni == null) return;
+  const next = st.queue[ni];
+  if (!next || next.url) return;
+  startCrossfade(ni, Math.min(fadeSec, remaining));
+}
+
+function startCrossfade(index: number, fadeSec: number) {
+  const st = usePlayerStore.getState();
+  const song = st.queue[index];
+  if (!song) return;
+  const outgoingSong = st.queue[st.index];
+  const out = activePlayer();
+  const p = ensurePlayer(1 - activeIdx);
+  try {
+    replaceSource(p, sourceFor(song));
+    p.loop = false;
+    p.volume = 0;
+    applySpeed(p, song);
+    p.play();
+  } catch {
+    return; // no crossfade: the normal track end will do the change
+  }
+  pushHistory();
+  consumeQueuedOnIndexChange(index);
+  fadingOut = out;
+  activeIdx = 1 - activeIdx;
+  setStreamOffset(0, p); // the incoming track starts from the beginning
+  sourceHasLength = null; // and it's another source: unknown until it loads
+  resetListen();
+  usePlayerStore.setState({
+    index,
+    positionSec: 0,
+    durationSec: song.duration ?? 0,
+    isPlaying: true,
+  });
+  applyLockScreen(p, song);
+  onTrackChanged(song);
+  resumeEpisodeAfterMove(song);
+  // Each end of the fade points to the effective volume of ITS song
+  // (ReplayGain per track); the user volume is read live on each tick.
+  runFade(p, fadeSec, gainFactor(outgoingSong), gainFactor(song));
+}
+
+/**
+ * Advances the crossfade one step according to elapsed time: crosses the
+ * volumes (equal power curve, the sum is perceived as constant) and, at the
+ * end, shuts off the outgoing and closes the fade. It's idempotent and without
+ * its own state, so both the foreground `setInterval` and the `onStatus`
+ * backup can call it without stepping on each other.
+ */
+function tickFade() {
+  if (!fadeState) return;
+  const { incoming, t0, fadeSec, outGain, inGain } = fadeState;
+  const x = Math.min(1, (Date.now() - t0) / (fadeSec * 1000));
+  const volume = usePlayerStore.getState().volume;
+  const out = fadingOut;
+  try {
+    if (out) out.volume = volume * outGain * Math.cos((x * Math.PI) / 2);
+    incoming.volume = volume * inGain * Math.sin((x * Math.PI) / 2);
+  } catch {
+    // ignore
+  }
+  if (x >= 1) {
+    if (fadeTimer) {
+      clearInterval(fadeTimer);
+      fadeTimer = null;
+    }
+    if (out) {
+      try {
+        out.pause();
+        out.volume = volume;
+      } catch {
+        // ignore
+      }
+    }
+    if (fadingOut === out) fadingOut = null;
+    fadeState = null;
+  }
+}
+
+/**
+ * Starts the fade: `fadingOut` was already set by `startCrossfade`. The 200 ms
+ * `setInterval` drives the smooth ramp in foreground; in background it freezes
+ * and the `onStatus` heartbeat takes over (see `fadeState`).
+ */
+function runFade(
+  incoming: AudioPlayer,
+  fadeSec: number,
+  outGain: number,
+  inGain: number,
+) {
+  if (fadeTimer) clearInterval(fadeTimer);
+  fadeState = { incoming, t0: Date.now(), fadeSec, outGain, inGain };
+  fadeTimer = setInterval(tickFade, 200);
+}
+
+// ── Short fade on pause/resume (only in-app controls) ────────────────────────
+// System play/pause (notification, lock screen, Android Auto, headphones)
+// go through native and stay instant, which is expected there.
+
+const PAUSE_FADE_MS = 180;
+let pauseFadeTimer: ReturnType<typeof setInterval> | null = null;
+
+/** The ramp in flight, so it can be closed out before its timer stops running. */
+let pendingFade: { p: AudioPlayer; to: number; onDone?: () => void } | null = null;
+
+/**
+ * Whether a volume ramp can be run at all.
+ *
+ * It is a `setInterval`, and JS timers do not run reliably once Android has put
+ * the app in the background. A ramp that stalls half way through is not a
+ * cosmetic loss: what pauses the player lives in its completion, so the
+ * speakers keep playing while everything on screen says paused, and on the way
+ * back in the volume stays at zero, so the song runs silently with its progress
+ * bar moving (#140). Backgrounded, the change is made outright.
+ */
+function canFade(): boolean {
+  return AppState.currentState === 'active';
+}
+
+/** Ends the ramp in flight where it was headed, and runs what was waiting on
+ *  it. For the moment the app leaves the foreground: whatever is left of a ramp
+ *  from then on may never run. */
+function settleFade() {
+  const fade = pendingFade;
+  if (!fade) return;
+  if (pauseFadeTimer) {
+    clearInterval(pauseFadeTimer);
+    pauseFadeTimer = null;
+  }
+  pendingFade = null;
+  try {
+    fade.p.volume = fade.to;
+  } catch {
+    // ignore
+  }
+  fade.onDone?.();
+}
+
+/** Linear ramp of `p`'s volume from `from` to `to` in PAUSE_FADE_MS; when done
+ *  calls `onDone`. Cancels any previous pause/resume ramp. */
+function fadeVolume(p: AudioPlayer, from: number, to: number, onDone?: () => void) {
+  if (pauseFadeTimer) {
+    clearInterval(pauseFadeTimer);
+    pauseFadeTimer = null;
+  }
+  pendingFade = { p, to, onDone };
+  const t0 = Date.now();
+  pauseFadeTimer = setInterval(() => {
+    const x = Math.min(1, (Date.now() - t0) / PAUSE_FADE_MS);
+    try {
+      p.volume = from + (to - from) * x;
+    } catch {
+      // ignore
+    }
+    if (x >= 1) {
+      if (pauseFadeTimer) clearInterval(pauseFadeTimer);
+      pauseFadeTimer = null;
+      pendingFade = null;
+      onDone?.();
+    }
+  }, 25);
+}
+
+// After a seek, the native player keeps emitting states with the old position
+// until the seek completes; if allowed through, the UI (slider, karaoke lyrics)
+// would bounce to the old position and jump back. While the seek is pending, the
+// requested position is held and crossfade is not evaluated (an old state near
+// the end would falsely trigger it).
+let pendingSeek: { sec: number; at: number } | null = null;
+
+/** expo-audio state listener: progress, play/pause and track end. */
+// ── Server-down detection during playback ───────────────────────────────────
+// autoUrl reacts to the network changing and to Home failing, so a server going
+// down mid-track goes unnoticed. A stall says it: a stream stuck buffering with
+// the position not moving asks for a probe.
+//
+// It is also the shape a bad connection takes when it does not fail outright,
+// the socket open and nothing arriving, so past `STALL_FALLBACK_MS` the
+// downloaded file takes over (see `onPlaybackError` for the failing case).
+const STALL_PROBE_MS = 6000;
+const STALL_FALLBACK_MS = 15000;
+let stallSince = 0;
+let stallPos = -1;
+let stallProbed = false;
+let stallFellBack = false;
+
+function maybeDetectStall(intendPlay: boolean, buffering: boolean, positionSec: number): void {
+  const st = usePlayerStore.getState();
+  const song = st.queue[st.index];
+  // Only applies online and to tracks coming from the server via streaming
+  // (what plays from disk does not depend on the server).
+  const streamed = !!song && !song.url && !localSourceFor(song);
+  if (useAuthStore.getState().offline || !intendPlay || !streamed || !buffering) {
+    stallSince = 0;
+    stallProbed = false;
+    stallFellBack = false;
+    stallPos = positionSec;
+    return;
+  }
+  // If the position advances, it's a normal rebuffer, not a stall — and any
+  // background wait for this track is over with it.
+  if (Math.abs(positionSec - stallPos) > 0.5) {
+    stallSince = 0;
+    stallProbed = false;
+    stallFellBack = false;
+    stallPos = positionSec;
+    stopBgRetry();
+    return;
+  }
+  const now = Date.now();
+  if (stallSince === 0) {
+    stallSince = now;
+    return;
+  }
+  if (!stallProbed && now - stallSince >= STALL_PROBE_MS) {
+    stallProbed = true; // once per stall; autoUrl already retries
+    checkAutoUrlNow();
+  }
+  // Fifteen seconds of a stream that is not arriving, with the song sitting on
+  // the disk: play that instead, from where it stopped. Only once per stall, and
+  // only for a song that has a file. For the rest there is nothing to move to,
+  // and the probe above is already asking whether the server is there at all.
+  if (!stallFellBack && now - stallSince >= STALL_FALLBACK_MS && song && copyOnPhone(song)) {
+    stallFellBack = true;
+    bump('player · fell back to the file after a stall');
+    failedSource.set(song.id, 'stream');
+    void reloadCurrent(positionSec, true);
+    return;
+  }
+  // Still stuck with nowhere to fall back to: backgrounded, this becomes the
+  // background wait rather than silence forever (see `startBgRetry`) — a
+  // stall nobody watches is the error give-up without the error. Foreground
+  // it stays a stall, with the spinner the watcher can see.
+  if (!stallFellBack && now - stallSince >= STALL_FALLBACK_MS && song && AppState.currentState !== 'active') {
+    stallFellBack = true;
+    gaveUp = { songId: song.id, at: Date.now() };
+    startBgRetry();
+  }
+}
+
+// ── When the player cannot play what it was given ────────────────────────────
+// media3 reports it (`error` on the status), and nothing here used to read it:
+// the app kept its playing state, the position stopped moving, and that was the
+// whole of it. A stream cut off by a bad connection and a downloaded file that
+// is no longer readable both ended the same way, as silence waiting for
+// somebody to press the next track.
+
+/** Which track the attempts below belong to, and how many it has had. */
+let errorTrackId: string | null = null;
+let errorAttempts = 0;
+/** Two: enough to ride out a hiccup, few enough not to retry a dead source. */
+const MAX_ERROR_ATTEMPTS = 2;
+/** The track given up on for a dead connection, waiting for the network to
+ *  come back (see `tryResumeAfterOutage`). Null the moment anything else
+ *  owns the player again — validated, not cleared, at resume time. */
+let gaveUp: { songId: string; at: number } | null = null;
+/** The active player last reported a failure and has not sounded since. media3
+ *  parks it in an error state that `play()` does not leave: only installing
+ *  the source again does. Cleared by any new source and by sound. */
+let playerFailed = false;
+/** Auto-resume only soon after giving up: hours later it would be a surprise
+ *  in a meeting, not a rescue in a tunnel. */
+const RESUME_WINDOW_MS = 15 * 60 * 1000;
+/** The background wait (see `startBgRetry`): its timer, if one is running. */
+let bgRetryTimer: ReturnType<typeof setTimeout> | null = null;
+/** Still waiting out a dead connection in the background. Set with `gaveUp`,
+ *  cleared the moment anything else owns the player (a press, another track,
+ *  the foreground) or the wait runs its course. */
+let bgWaiting = false;
+let bgRounds = 0;
+/** How many reloads the background wait gets: about half an hour of asking
+ *  once a minute, then it stops asking a server that is not answering. */
+const BG_RETRY_ROUNDS = 30;
+const BG_RETRY_MS = 60_000;
+const BG_RETRY_FIRST_MS = 15_000;
+
+function stopBgRetry() {
+  bgWaiting = false;
+  bgRounds = 0;
+  if (bgRetryTimer) {
+    clearTimeout(bgRetryTimer);
+    bgRetryTimer = null;
+  }
+}
+
+function scheduleBgRetry(ms: number) {
+  if (bgRetryTimer) clearTimeout(bgRetryTimer);
+  bgRetryTimer = setTimeout(() => {
+    bgRetryTimer = null;
+    void bgRetryRound();
+  }, ms);
+}
+
+function startBgRetry() {
+  if (bgWaiting) return;
+  bgWaiting = true;
+  bgRounds = 0;
+  scheduleBgRetry(BG_RETRY_FIRST_MS);
+}
+
+/**
+ * One round of the background wait: the current track reloaded at the saved
+ * second. Anything else owning the player by now ends the wait instead: a
+ * press, another track, a stop, the foreground.
+ */
+async function bgRetryRound() {
+  if (!bgWaiting || AppState.currentState === 'active' || remoteKind()) {
+    stopBgRetry();
+    return;
+  }
+  const st = usePlayerStore.getState();
+  const song = st.queue[st.index];
+  if (!song || !gaveUp || song.id !== gaveUp.songId || !st.isPlaying) {
+    stopBgRetry();
+    return;
+  }
+  if (++bgRounds > BG_RETRY_ROUNDS) {
+    // A server that is not answering: stop asking, silently — nobody is
+    // watching, and the foreground return shows the stopped truth.
+    stopBgRetry();
+    usePlayerStore.setState({ isPlaying: false, isBuffering: false });
+    return;
+  }
+  bump('player · retrying the track in background');
+  try {
+    await reloadCurrent(st.positionSec, true);
+  } catch {
+    // The next round asks again.
+  }
+  if (bgWaiting) scheduleBgRetry(BG_RETRY_MS);
+}
+
+/**
+ * The error in its own words, with anything that looks like an address taken
+ * out: this is counted, and counts are what the Diagnostics report is made of.
+ * A stream URL carries the credentials, so none of them can go in it.
+ */
+function errorTag(message: string): string {
+  const clean = message
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, 'url')
+    .replace(/\/[\w./-]{16,}/g, 'path')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return clean.length > 80 ? `${clean.slice(0, 80)}…` : clean;
+}
+
+/**
+ * Answers a playback failure: the other copy of the song if it has one, a
+ * second go at the same one if it does not, and the truth if neither sounds.
+ *
+ * Deliberately not the next track. A failure that skips walks a whole album in
+ * silence, and the one thing the person watching needs to know is that this
+ * song is not playing, which a toast says and an advancing queue hides.
+ */
+function onPlaybackError(message: string, wasPlaying: boolean): void {
+  const st = usePlayerStore.getState();
+  const song = st.queue[st.index];
+  bump(`player · playback error (${errorTag(message)})`);
+  playerFailed = true;
+  if (!song) return;
+  if (errorTrackId !== song.id) {
+    errorTrackId = song.id;
+    errorAttempts = 0;
+  }
+  note(
+    `playback error: ${errorTag(message)} · ${song.id} · ${localSourceFor(song) ? 'file' : 'stream'} · attempt ${errorAttempts + 1}`,
+  );
+  if (errorAttempts >= MAX_ERROR_ATTEMPTS) {
+    bump('player · gave up on the track');
+    awaitingSource = false;
+    releaseSpeculation();
+    // Where it stopped is written down now, not at the next tick: the queue
+    // position is only saved every so often, so coming back without this
+    // would resume minutes before the stop instead of at it.
+    saveQueueLocal(true);
+    // And the door is left open for the network coming back (see
+    // `tryResumeAfterOutage`): a tunnel is not a dead server.
+    gaveUp = { songId: song.id, at: Date.now() };
+    // Backgrounded, the stop is not final: nobody is watching, and killing
+    // the intent kills the session iOS keeps the app alive for. Wait it out
+    // with retries instead; the foreground return finalizes. Foreground, or
+    // remote output, it ends here as before.
+    if (AppState.currentState !== 'active' && !remoteKind()) {
+      startBgRetry();
+      return;
+    }
+    usePlayerStore.setState({ isPlaying: false, isBuffering: false });
+    useToast.getState().show(tg("Couldn't play the song"));
+    return;
+  }
+  errorAttempts++;
+  // The other copy, and only the first time round: once it is marked, what just
+  // failed IS the other copy, and swapping back would be a loop.
+  // Episodes are in too: their two copies are the file and the enclosure.
+  if (!failedSource.has(song.id) && (!song.url || song.podcastChannelId)) {
+    const { auth, offline } = useAuthStore.getState();
+    if (localSourceFor(song)) {
+      // The phone's own library has no stream behind it, and neither has a
+      // download with no connection: the mark is only worth putting on when
+      // there is somewhere else to play from. A song of the phone's own is the
+      // one with a `localUri` and no download: the mark of a download built
+      // offline is that same field (see `markUnplayableOffline`), and behind
+      // that one there is a server.
+      const phoneOnly = !!song.localUri && !copyOnPhone(song);
+      if (!phoneOnly && auth && !offline) failedSource.set(song.id, 'file');
+      // And a download whose file is not there at all should stop being
+      // promised, by its badge and by the catalog behind it.
+      void useDownloads.getState().forgetIfMissing(song.id);
+      void useSongCache.getState().forgetIfMissing(song.id);
+    } else if (copyOnPhone(song)) {
+      failedSource.set(song.id, 'stream');
+    }
+  }
+  void reloadCurrent(st.positionSec, wasPlaying).then((loaded) => {
+    if (!loaded) waitForNetwork(song.id);
+  });
+}
+
+/**
+ * A reload that installed nothing because the app went offline, with nothing
+ * of the song on the phone: it gives up before there is a second error to give
+ * up on. Same answer as giving up: where it stopped is kept, and the network
+ * coming back resumes it (see `tryResumeAfterOutage`).
+ */
+function waitForNetwork(songId: string): void {
+  if (!useAuthStore.getState().offline) return;
+  const now = usePlayerStore.getState();
+  if (now.queue[now.index]?.id !== songId) return;
+  saveQueueLocal(true);
+  gaveUp = { songId, at: Date.now() };
+}
+
+/** Installs the current track again, at the second it had got to. False when
+ *  nothing was installed. */
+async function reloadCurrent(atSec: number, autoplay: boolean): Promise<boolean> {
+  const { index, queue } = usePlayerStore.getState();
+  const song = queue[index];
+  if (!song) return false;
+  if (!(await loadIndex(index, autoplay))) return false;
+  // `loadIndex` starts the song at zero, which is right for everything else
+  // that calls it: what failed here was in the middle of one. And only if it is
+  // still the same song, since anything the person did while this loaded owns
+  // the player now.
+  const now = usePlayerStore.getState();
+  if (now.queue[now.index]?.id !== song.id) return true;
+  if (atSec > 0) {
+    seekActive(atSec);
+    usePlayerStore.setState({ positionSec: atSec });
+  }
+  return true;
+}
+
+/**
+ * The network is back after giving up on a track: play it again from where
+ * it stopped, without being asked. Validated, not trusted: anything started,
+ * moved or resumed since clears it instead. Not for remote output, whose
+ * transport belongs to the device, and not forever after — only in the
+ * window where coming back still reads as continuing.
+ */
+async function tryResumeAfterOutage(): Promise<void> {
+  if (!gaveUp || remoteKind()) return;
+  const st = usePlayerStore.getState();
+  const song = st.queue[st.index];
+  if (!song || song.id !== gaveUp.songId) {
+    gaveUp = null;
+    return;
+  }
+  // Somebody resumed by hand meanwhile: nothing to take over.
+  if (st.isPlaying && !bgWaiting) {
+    gaveUp = null;
+    return;
+  }
+  if (Date.now() - gaveUp.at > RESUME_WINDOW_MS) {
+    gaveUp = null;
+    stopBgRetry();
+    return;
+  }
+  // The connection is back before the app has left offline mode, which takes
+  // a probe of its own: a reload now would only find nothing playable. Leaving
+  // offline mode asks again (see `attachAppState`).
+  if (useAuthStore.getState().offline) return;
+  // Taking over: a background wait (if any) ends here, and the reload below
+  // either plays or fails back into the wait through the error path.
+  stopBgRetry();
+  gaveUp = null;
+  bump('player · resuming after the network came back');
+  try {
+    await reloadCurrent(st.positionSec, true);
+  } catch {
+    // No network after all, or nothing to load with.
+  }
+}
+
+/** When the last status was taken in, and how close a next one means a pile. */
+let lastStatusAt = 0;
+const BACKLOG_GAP_MS = 200;
+/**
+ * How often the plain position reaches the store while backgrounded. Nobody
+ * watches the slider out there: pushing it 2×/s only re-renders every
+ * subscriber all night. Material changes (play/pause, buffering, duration,
+ * track end) always go through at once.
+ */
+const BG_POSITION_PUSH_MS = 5000;
+let lastBgPositionPush = 0;
+
+/** `live`: read from the player just now, never part of a pile. */
+/**
+ * The length to show and to seek within: the player's own, which is exact to
+ * the millisecond, unless it is clearly wrong. A stream the server transcodes
+ * on the fly starts with an MP3 header written before any frame exists, which
+ * says zero frames, and the player took that for a song a fraction of a
+ * second long: 0:00 at the end of the bar, the bar full, and every seek
+ * clamped back to the start. Less than half of what the server says the song
+ * lasts is that, and the server's figure is kept instead.
+ */
+function plausibleDuration(native: number | undefined, fallback: number, known?: number): number {
+  if (!native || !(native > 0)) return fallback;
+  if (known && known > 0 && native < known * 0.5) return known;
+  return native;
+}
+
+function onStatus(status: AudioStatus, live = false) {
+  // Before anything can decide not to use it. This beat is the only clock that
+  // survives the app being minimized, so whether it arrives is the first thing
+  // worth knowing about the minutes nobody was watching (see `beat`).
+  beat(status.playing);
+  // With remote output (UPnP/DLNA) the local player is paused and its
+  // states should not override those coming from the remote device.
+  if (remoteKind()) return;
+  // Sounding again after waiting it out in the background: the wait is over,
+  // whichever round did it.
+  if (bgWaiting && status.playing) stopBgRetry();
+  // Sleep timer fallback: if setTimeout got frozen in background, the
+  // native player heartbeat fires it here.
+  const endsAt = sleepDeadline();
+  if (endsAt && Date.now() >= endsAt) {
+    fireSleepTimer();
+    return;
+  }
+  // Same fallback for the fade: if its timer got frozen, or if an
+  // intervention released it and expiry is still within the window, the
+  // player heartbeat re-arms it with whatever is left.
+  if (endsAt && !sleepFadeTimer) {
+    const left = endsAt - Date.now();
+    if (left <= SLEEP_FADE_MS) startSleepFade(left);
+  }
+  // Crossfade fallback: its setInterval freezes in background, but
+  // this native heartbeat stays alive, so the volume ramp advances anyway and
+  // the incoming song stops staying silent at volume 0 on minimize.
+  if (fadeState) tickFade();
+  const prev = usePlayerStore.getState();
+  // A backlog, not a beat (#192). Where the system freezes the app in the
+  // background (Android Go does), the beats of the whole time away wait in line
+  // and arrive back to back on the way in, each one redrawing the bar, the mini
+  // player and the lyrics: four minutes away was eight seconds of the player
+  // showing the song from before, on a phone slow enough to freeze it. The
+  // live beats are half a second apart, so one that lands right on the last is
+  // part of a pile, and one that changes nothing but the position is dropped.
+  // The return itself reads the player's live status (see `attachAppState`).
+  const now = Date.now();
+  const routine =
+    !status.didJustFinish &&
+    !status.error &&
+    status.isLoaded &&
+    !status.isBuffering &&
+    status.playing === prev.isPlaying &&
+    !prev.isBuffering &&
+    !pendingSeek &&
+    !fadeState;
+  if (routine && !live && now - lastStatusAt < BACKLOG_GAP_MS) {
+    bump('player · piled-up beat dropped');
+    return;
+  }
+  lastStatusAt = now;
+  // Buffering if we want to play but audio isn't flowing yet (initial load,
+  // streaming rebuffer, seek…). If paused, it's not buffering.
+  const intendPlay = status.playing || prev.isPlaying;
+  // The player could not play what it was handed. Nothing below this applies:
+  // the status that comes with a failure is a stopped player at a position that
+  // is not going to move, and what to do about that is its own question.
+  if (status.error) {
+    onPlaybackError(status.error, intendPlay);
+    return;
+  }
+  if (awaitingSource && status.isLoaded && !status.isBuffering) {
+    awaitingSource = false;
+    releaseSpeculation();
+  }
+  // Sound: whatever it took, this track is not the failing one any more.
+  if (status.playing) playerFailed = false;
+  if (status.playing && errorTrackId) {
+    errorTrackId = null;
+    errorAttempts = 0;
+  }
+  const buffering =
+    intendPlay && !status.didJustFinish && (status.isBuffering || !status.isLoaded);
+  // Only once loaded: while buffering the duration is still unknown and would
+  // pass for a stream generated on the fly (see `sourceHasLength`).
+  if (status.isLoaded) {
+    const hasLength = (status.duration ?? 0) > 0;
+    const song = currentSong(usePlayerStore.getState());
+    if (sourceHasLength === null && !hasLength && song && !song.url && !localSourceFor(song)) {
+      bump('player · stream with no length');
+      note(`stream with no length: ${song.id}${isTranscoded(song) ? ' · transcoding asked' : ''}`);
+    }
+    sourceHasLength = hasLength;
+  }
+  // With a stream re-requested with timeOffset, the native player counts from 0:
+  // the real position is the offset plus its time.
+  let positionSec = streamOffsetSec + (status.currentTime ?? 0);
+  if (pendingSeek) {
+    if (Math.abs(positionSec - pendingSeek.sec) < 1 || Date.now() - pendingSeek.at > 2000) {
+      pendingSeek = null; // the player reached the target (or we gave up)
+    } else {
+      positionSec = pendingSeek.sec;
+    }
+  }
+  // With offset active the native reports the duration of the remaining segment,
+  // not the song's: the known duration is kept.
+  const nextDurationSec =
+    streamOffsetSec > 0
+      ? prev.durationSec
+      : plausibleDuration(status.duration, prev.durationSec, currentSong(prev)?.duration);
+  // During pause/resume fade the native player keeps playing for a few ms;
+  // we keep the already-set state so the button doesn't flicker.
+  const nextIsPlaying = pauseFadeTimer ? prev.isPlaying : status.playing;
+  // Backgrounded, the plain position is pushed at most every few seconds (see
+  // `BG_POSITION_PUSH_MS`): 2×/s `setState` re-renders every subscriber all
+  // night on iOS, where timers keep running. Everything below (scrobble,
+  // stall, crossfade, track end) still runs on every beat off the local value.
+  const material =
+    AppState.currentState === 'active' ||
+    nextIsPlaying !== prev.isPlaying ||
+    buffering !== prev.isBuffering ||
+    nextDurationSec !== prev.durationSec ||
+    status.didJustFinish;
+  if (material || now - lastBgPositionPush >= BG_POSITION_PUSH_MS) {
+    lastBgPositionPush = now;
+    usePlayerStore.setState({
+      positionSec,
+      durationSec: nextDurationSec,
+      isPlaying: nextIsPlaying,
+      isBuffering: buffering,
+    });
+  }
+  noteEpisodeBeat(status, prev.isPlaying && !status.playing);
+  maybeScrobbleThreshold(positionSec, status.playing);
+  maybeDetectStall(intendPlay, buffering, positionSec);
+  // Queue sync with the server.
+  if (status.playing) {
+    // Something is actually coming out of the speaker: from here on this
+    // device has an opinion worth sending (see `playedHere`).
+    markPlayedHere();
+    startPeriodicSync();
+  } else {
+    stopPeriodicSync();
+    if (prev.isPlaying) scheduleSync(); // just paused
+  }
+  if (!pendingSeek) maybeStartCrossfade(status);
+  if (status.didJustFinish) {
+    if (handleSleepAtSongEnd()) return;
+    // Repeating one song is normally the native `loop` and never gets here. A
+    // source that only holds part of the song (re-requested with `timeOffset`)
+    // cannot be looped, though — it would replay that part — so it ends for
+    // real and the song is asked for again from the beginning, which restores
+    // the native loop for the plays after this one.
+    const st = usePlayerStore.getState();
+    if (st.repeat === 'one') {
+      void loadIndex(st.index, true);
+      return;
+    }
+    const ni = nextIndex(false);
+    if (ni == null) {
+      usePlayerStore.setState({ isPlaying: false });
+    } else {
+      pushHistory();
+      void loadIndex(ni, true);
+    }
+  }
+}
+
+/**
+ * "At end of song" timer: if active, stops here and leaves the next track
+ * loaded but paused. Returns true if it consumed the track end.
+ */
+function handleSleepAtSongEnd(): boolean {
+  const { sleepAtSongEnd, repeat } = usePlayerStore.getState();
+  if (!sleepAtSongEnd) return false;
+  usePlayerStore.setState({ isPlaying: false });
+  cutCrossfade();
+  activePlayer()?.pause();
+  const ni = nextIndex(false);
+  // The timer stays on until the next track is in the player. Turning it off
+  // first brought the gapless queue back to life for the length of this
+  // handler, and queueing a source behind a track that has already ended does
+  // not queue anything: the player takes it as the one to play now and
+  // announces the move, late enough for that announcement to be read as a jump
+  // to whatever had been queued after it (#177).
+  const clear = () => usePlayerStore.setState({ sleepAtSongEnd: false });
+  if (ni == null || repeat === 'one') clear();
+  else void loadIndex(ni, false).finally(clear);
+  return true;
+}
+
+// ── Local queue persistence (resume on app reopen) ──────────────────────────
+// Complements server sync: works in local/offline mode too and preserves
+// downloaded songs and radios, which the server doesn't accept in
+// savePlayQueue.
+
+/** Where the queue of the profile in use lives on disk, or null when no
+ *  profile is in use and there is nothing to save. The rule itself — the
+ *  account first, the mode not at all — is `queueKeyFor`, where the test can
+ *  reach it without the app's state. */
+function queueStorageKey(): string | null {
+  const { auth, offline } = useAuthStore.getState();
+  return queueKeyFor(auth, offline);
+}
+
+interface StoredQueue {
+  queue: Song[];
+  index: number;
+  positionSec: number;
+  /** The queue was a radio: when restoring it must keep extending itself. */
+  radioMode?: boolean;
+  /** Track the radio was started from, so it keeps extending from the same
+   *  place after a restart. Absent in queues saved by older versions: those
+   *  fall back to seeding off the tail. */
+  radioSeed?: Song | null;
+  /** Where the queue came from, for the player's "playing from" header. */
+  source?: string | null;
+  /** Route of that origin, so tapping the header still navigates there. */
+  sourceHref?: string | null;
+  /**
+   * Shuffle and repeat as they were left (#102). Both are how someone listens
+   * rather than something they set up once, and finding them off after every
+   * cold start meant turning them on again each morning. `originalQueue` is
+   * NOT saved: it would double what a queue weighs, and turning shuffle off
+   * without it keeps the order that is playing instead of restoring the
+   * album's, which is a fair price for a session that already ended.
+   */
+  shuffle?: boolean;
+  repeat?: RepeatMode;
+  /** Speed and varispeed as they were left (#325). */
+  speed?: number;
+  varispeed?: boolean;
+  /** The queue was dealt when it was started (see `queueDealt`). */
+  dealt?: boolean;
+  /**
+   * When this device last wrote it (ms). Only read to compare against the
+   * server's copy: what is newer decides which of the two is somebody's last
+   * word, and a phone that listened all afternoon with no connection must not
+   * be handed yesterday's queue from another player on reconnecting.
+   */
+  savedAt?: number;
+}
+
+/** Guards what comes back from disk: the file is ours, but an older version's
+ *  (or a hand-edited one's) is not worth trusting into the player. */
+function isRepeatMode(v: unknown): v is RepeatMode {
+  return v === 'off' || v === 'one' || v === 'all';
+}
+
+/**
+ * Something other than the position changed since the last write. Set by the
+ * store subscription at the end of this file.
+ *
+ * The periodic sync runs every twenty seconds while playing, and rewriting up
+ * to 500 whole songs into SecureStore, which encrypts them, to move one number
+ * is exactly the kind of work that shows up as a dropped tap (#50). In the
+ * foreground it now writes only when the queue itself moved; in the background
+ * it writes as before, since the position does keep advancing there and nobody
+ * is waiting on the JS thread.
+ */
+let queueDirty = true;
+
+/** How often the queue is rewritten while backgrounded with nothing but the
+ *  position moving: SecureStore encrypts every write, and on a locked phone
+ *  those writes can fail outright — while nobody is waiting on them. Track
+ *  changes still write at once (see `queueDirty`), so coming back always
+ *  resumes the right song. */
+const BG_SAVE_MS = 120_000;
+
+/** When this device's queue was last written, for the comparison in
+ *  `adoptNewerServerQueue`. Zero until something is saved or restored. */
+let localSavedAt = 0;
+
+/**
+ * Rewrites the ids in the queue, in memory and on disk.
+ *
+ * Without it, the first thing a migrated server does is a queue that will not
+ * start: it is restored on launch from songs whose ids the server has
+ * forgotten. Nothing is lost, and one tap on anything else gets out of it, but
+ * it is the most visible thing left after a migration.
+ *
+ * `sourceHref` is not touched. It is a route with an id inside it, and picking
+ * that apart means knowing every route shape; getting it wrong sends the
+ * "playing from" header somewhere that does not exist, which is worse than the
+ * header being right and its link stale.
+ */
+export function remapQueueIds(f: Remap) {
+  const { queue, radioSeed } = usePlayerStore.getState();
+  if (queue.length === 0 && !radioSeed) return;
+  usePlayerStore.setState({
+    queue: queue.map((s) => remapSong(s, f)),
+    radioSeed: radioSeed ? remapSong(radioSeed, f) : radioSeed,
+  });
+  saveQueueLocal(true);
+}
+
+function saveQueueLocal(force = false) {
+  const key = queueStorageKey();
+  if (!key) return;
+  const {
+    queue,
+    index,
+    positionSec,
+    radioMode,
+    radioSeed,
+    source,
+    sourceHref,
+    shuffle,
+    queueDealt,
+    repeat,
+    speed,
+    varispeed,
+  } = usePlayerStore.getState();
+  if (queue.length === 0) return;
+  if (!force && !queueDirty && AppState.currentState === 'active') return;
+  // Backgrounded with only the position moving: at most one write per couple
+  // of minutes instead of every twenty seconds.
+  if (!force && !queueDirty && Date.now() - localSavedAt < BG_SAVE_MS) return;
+  queueDirty = false;
+  // Size cap as a precaution for SecureStore; 500 songs is more than enough.
+  const payload: StoredQueue = {
+    queue: queue.slice(0, 500),
+    index: Math.min(index, 499),
+    positionSec,
+    radioMode,
+    radioSeed,
+    source,
+    sourceHref,
+    shuffle,
+    dealt: queueDealt,
+    repeat,
+    speed,
+    varispeed,
+    savedAt: Date.now(),
+  };
+  localSavedAt = payload.savedAt ?? 0;
+  void setItem(key, JSON.stringify(payload));
+}
+
+/**
+ * Forgets the active profile's saved queue (the user emptied it on purpose).
+ * An empty queue is saved instead of deleting the key: it's the "tombstone"
+ * that prevents restoreQueue from resurrecting the server copy on the next
+ * startup (the server offers no reliable way to delete its own).
+ */
+function clearQueueLocal() {
+  const key = queueStorageKey();
+  if (!key) return;
+  // The tombstone carries how the person was listening, because that is not
+  // part of the queue that was emptied. Left out, shuffle and repeat were
+  // written over with nothing the moment the queue was cleared, and nothing
+  // put them back: `saveQueueLocal` gives up on an empty queue, so the next
+  // cold start read them as off. Kept on while the app is open and gone after
+  // a restart is the kind of difference nobody can explain to themselves
+  // (reported by @ztx-lyghters).
+  const { shuffle, repeat, speed, varispeed } = usePlayerStore.getState();
+  // Dated like any other write: emptying the queue is this device's last word
+  // on it, and what decides whether another player's is newer.
+  const empty: StoredQueue = {
+    queue: [],
+    index: 0,
+    positionSec: 0,
+    shuffle,
+    repeat,
+    speed,
+    varispeed,
+    savedAt: Date.now(),
+  };
+  localSavedAt = empty.savedAt ?? 0;
+  void setItem(key, JSON.stringify(empty));
+}
+
+/**
+ * The queue from another player, when it is the newer of the two.
+ *
+ * The copy on this device is the faithful one — it knows about downloads,
+ * radios and how the queue was started, none of which fits in a Subsonic queue
+ * — so it is what comes back on a cold start and the server's is only a backup
+ * for a device that has none. That left no way in for the thing people
+ * actually want from this: leaving an album half played on the computer and
+ * finding it here.
+ *
+ * Two conditions, and both matter. `changedBy` says who wrote the server's copy
+ * last, and if it was us there is nothing there we do not already have. The
+ * timestamps say whether their copy is newer than this device's last word,
+ * which is what protects an afternoon of listening with no connection —
+ * nothing was pushed, but the queue here was still being written down.
+ */
+let lastAdoptCheck = 0;
+/** When the app last left the foreground, so a quick trip to another app is
+ *  not treated as somebody coming back from a different player. */
+let wentAway = 0;
+
+/** Marker left while the app is away: if it is still there at launch, the
+ *  previous session never came back — killed in the background, not closed.
+ *  A plain file, not SecureStore, which can refuse writes on a locked phone.
+ *  Foreground deletes it, so its presence means the return never happened. */
+function awayMarkerPath(): string | null {
+  const dir = FileSystem.documentDirectory;
+  return dir ? `${dir}away.json` : null;
+}
+
+function markAway() {
+  const path = awayMarkerPath();
+  if (!path) return;
+  void FileSystem.writeAsStringAsync(path, JSON.stringify({ at: Date.now() })).catch(() => {});
+}
+
+function clearAway() {
+  const path = awayMarkerPath();
+  if (!path) return;
+  void FileSystem.deleteAsync(path, { idempotent: true }).catch(() => {});
+}
+
+/** Once, at startup: was the last session killed while away? Answered into
+ *  the diagnostics, where the shared report picks it up. */
+export function checkBackgroundDeath() {
+  const path = awayMarkerPath();
+  if (!path) return;
+  void (async () => {
+    try {
+      const info = await FileSystem.getInfoAsync(path);
+      if (!info.exists) return;
+      const raw = await FileSystem.readAsStringAsync(path);
+      await FileSystem.deleteAsync(path, { idempotent: true }).catch(() => {});
+      let at = 0;
+      try {
+        at = Number(JSON.parse(raw)?.at) || 0;
+      } catch {
+        // A half-written marker still means away, only without the when.
+      }
+      note(
+        at > 0
+          ? `background death: last seen away ${Math.round((Date.now() - at) / 1000)}s before launch`
+          : 'background death: away marker with no time',
+      );
+    } catch {
+      // The marker is a hint, not data: failing to read it changes nothing.
+    }
+  })();
+}
+
+async function adoptNewerServerQueue(): Promise<void> {
+  if (!useSettings.getState().syncQueueFromServer) return;
+  const { auth, offline } = useAuthStore.getState();
+  if (!auth || offline) return;
+  const before = usePlayerStore.getState();
+  // Somebody is already listening: their queue is not up for replacing.
+  if (before.isPlaying) return;
+  // Coming back to the app is a common thing to do, and what this asks for is
+  // the whole queue with the metadata of every song in it — a few hundred
+  // kilobytes of JSON parsed on the thread that draws. Once a minute, and only
+  // after a while away, is as often as anybody changes players.
+  if (Date.now() - lastAdoptCheck < 60_000) return;
+  lastAdoptCheck = Date.now();
+  let saved;
+  try {
+    saved = await getPlayQueue(auth);
+  } catch {
+    return;
+  }
+  if (!saved || saved.entries.length === 0) return;
+  // Same answer the push guard asks for, already paid for here.
+  lastOwnerCheck = { at: Date.now(), theirs: !!saved.changedBy && saved.changedBy !== CLIENT_NAME };
+  if (!saved.changedBy || saved.changedBy === CLIENT_NAME) return;
+  // A server that does not date its queue cannot be shown to be newer, and
+  // guessing here is how somebody loses what they were listening to.
+  if (!saved.changed || !localSavedAt || saved.changed <= localSavedAt) return;
+  const now = usePlayerStore.getState();
+  // Anything that happened while the server was answering wins: a tap, a track
+  // change, the queue being emptied.
+  if (now.isPlaying || now.queue !== before.queue || now.index !== before.index) return;
+  await usePlayerStore.getState().restoreFromServer(true);
+}
+
+// ── Queue sync with server (savePlayQueue/getPlayQueue) ─────────────────────
+let syncTimer: ReturnType<typeof setTimeout> | null = null;
+let syncInterval: ReturnType<typeof setInterval> | null = null;
+let appStateAttached = false;
+
+/**
+ * Whether anything has actually been listened to here since this queue arrived.
+ *
+ * A queue that came off the disk or off the server and has not been played is
+ * not this device's opinion about anything, and pushing it says otherwise. The
+ * plainest way to see why that matters: open the app, let it restore what you
+ * were on yesterday, do not press play, leave. That used to write yesterday's
+ * queue over whatever another player had left there since (#188).
+ */
+let playedHere = false;
+
+/** Called when a track actually starts on this device. */
+function markPlayedHere(): void {
+  playedHere = true;
+}
+
+/** And when the queue is somebody else's word rather than ours. */
+function clearPlayedHere(): void {
+  playedHere = false;
+}
+
+let lastOwnerCheck = { at: 0, theirs: false };
+
+/** A push of our own makes this device the last writer, which is the same
+ *  answer the check below would come back with, one request later. */
+function markWeOwnServerQueue(): void {
+  lastOwnerCheck = { at: Date.now(), theirs: false };
+}
+
+/** How long that answer is worth reusing. Pausing and then leaving the app is
+ *  two pushes moments apart, and this asks for the whole queue's worth of JSON. */
+const OWNER_CHECK_TTL = 10_000;
+
+/**
+ * Is the copy on the server somebody else's latest word?
+ *
+ * Asked before a push that is not backed by playback. Subsonic has no
+ * conditional save (no if-match, no revision), so the only way not to trample
+ * a newer queue is to look first. `changedBy` alone answers it: if the last
+ * client to write was not this one, then whoever it was spoke after us, and a
+ * paused queue here has no business overruling that.
+ *
+ * A server that sends no `changedBy` can never be shown to belong to somebody
+ * else, and then this says no and the push goes ahead, which is the behaviour
+ * every version before this one had.
+ */
+async function serverQueueIsSomeoneElses(auth: SubsonicAuth): Promise<boolean> {
+  if (Date.now() - lastOwnerCheck.at < OWNER_CHECK_TTL) return lastOwnerCheck.theirs;
+  let theirs = false;
+  try {
+    const saved = await getPlayQueue(auth);
+    theirs = !!saved && saved.entries.length > 0 && !!saved.changedBy && saved.changedBy !== CLIENT_NAME;
+  } catch {
+    // Unreachable, timed out, or a server with no getPlayQueue at all: not an
+    // answer, and refusing to push on a failed request would quietly stop the
+    // queue syncing for those servers. Not cached either, so the next push
+    // asks again rather than inheriting a guess.
+    return false;
+  }
+  lastOwnerCheck = { at: Date.now(), theirs };
+  return theirs;
+}
+
+/** Saves the queue on this device and, if there is a session, on the server. */
+function syncQueueNow(force = false, syncRemote = true) {
+  saveQueueLocal(force);
+  // The local copy above is the one that matters offline, and it is the only
+  // one written there: the server's copy is a request, and offline mode makes
+  // none. Without this the queue was pushed every twenty seconds and on every
+  // trip to the background, which is a phone using data its owner said not to.
+  const { auth, offline } = useAuthStore.getState();
+  const { queue, index, positionSec, isPlaying } = usePlayerStore.getState();
+  const current = queue[index];
+  if (auth && !offline && current && !current.url && !current.localUri) {
+    const ids = queue.filter((s) => !s.url && !s.localUri).map((s) => s.id);
+    if (ids.length > 0) {
+      const positionMs = Math.floor(positionSec * 1000);
+      if (isPlaying) {
+        // Sounding here: this queue is the newest one there is by definition,
+        // and the twenty-second tick must not turn into two requests. Marked
+        // from the store's own state and not only from the native status, so
+        // that a queue playing on a speaker counts the same as one playing on
+        // the phone: the native player is silent during a cast.
+        markPlayedHere();
+        markWeOwnServerQueue();
+        void savePlayQueue(auth, ids, current.id, positionMs);
+      } else if (playedHere) {
+        // Paused, or on the way to the background. One look before writing.
+        void (async () => {
+          if (await serverQueueIsSomeoneElses(auth)) return;
+          // Playback may have resumed while the server answered, and then the
+          // ids and the second gathered above are already out of date; the
+          // tick that comes with playing will push the current ones.
+          if (usePlayerStore.getState().isPlaying) return;
+          markWeOwnServerQueue();
+          await savePlayQueue(auth, ids, current.id, positionMs);
+        })();
+      }
+    }
+  }
+  if (syncRemote) syncJukeboxUpcoming();
+  if (syncRemote && remoteKind() === 'upnp') {
+    void syncUpnpRemoteQueue(
+      {
+        queue,
+        index,
+        positionSec,
+        isPlaying: usePlayerStore.getState().isPlaying,
+        shuffle: usePlayerStore.getState().shuffle,
+        repeat: usePlayerStore.getState().repeat,
+      },
+      force,
+    );
+  }
+}
+
+function scheduleSync() {
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(syncQueueNow, 2500);
+}
+
+/**
+ * Every so often while a song plays: the queue, and where in the song it is.
+ *
+ * The server shows the position it was last told, and it is only told when
+ * something changes — so a song nobody touches sits at the second it started
+ * on, which is what the panel of a server that has been playing for a minute
+ * was showing (00:00 while the phone was at 1:20). Saying it again also keeps
+ * the entry alive, which is the other half of what a Now Playing list is.
+ */
+function periodicSync() {
+  syncQueueNow();
+  const st = usePlayerStore.getState();
+  if (st.isPlaying) reportState('playing', st.queue[st.index], st.positionSec);
+}
+
+const SYNC_MS = 20_000;
+/**
+ * The sync while backgrounded. The server entry only needs keeping alive out
+ * there, not a 20 s refresh all night (on iOS timers keep running in the
+ * audio background).
+ */
+const SYNC_BG_MS = 120_000;
+
+/** Whether playback currently wants the periodic sync (armed rate follows AppState). */
+let syncWanted = false;
+
+function armSync() {
+  if (syncInterval) {
+    clearInterval(syncInterval);
+    syncInterval = null;
+  }
+  if (!syncWanted) return;
+  syncInterval = setInterval(periodicSync, AppState.currentState === 'active' ? SYNC_MS : SYNC_BG_MS);
+}
+
+function startPeriodicSync() {
+  if (syncWanted && syncInterval) return;
+  syncWanted = true;
+  armSync();
+}
+
+function stopPeriodicSync() {
+  syncWanted = false;
+  if (syncInterval) {
+    clearInterval(syncInterval);
+    syncInterval = null;
+  }
+}
+
+function attachAppState() {
+  if (appStateAttached) return;
+  appStateAttached = true;
+  // A return of the connection after giving up on a track resumes it (see
+  // `tryResumeAfterOutage`): edge-triggered, so a state that arrives already
+  // up does not count as a return.
+  let netUp = true;
+  Network.addNetworkStateListener((state) => {
+    const up = !!state.isConnected && state.isInternetReachable !== false;
+    if (!up) {
+      netUp = false;
+      return;
+    }
+    if (!netUp) {
+      netUp = true;
+      void tryResumeAfterOutage();
+    }
+  });
+  // And the app leaving offline mode, which is what makes the track playable
+  // again when the connection came back first.
+  useAuthStore.subscribe((now, prev) => {
+    if (!prev.offline || now.offline) return;
+    void tryResumeAfterOutage();
+    // And a mix whose last round came back empty while the connection was
+    // going asks again, rather than waiting for a track change that may never
+    // come if the queue has already run out.
+    void maybeQueueAutoplay();
+  });
+  AppState.addEventListener('change', (st) => {
+    // The periodic sync rate follows the state (fast in foreground, slow in
+    // background): re-arm on every change so it switches both ways.
+    if (syncWanted) armSync();
+    if (st !== 'active') {
+      // A ramp started an instant ago is about to lose its timer, and with it
+      // whatever was waiting on the end of it (the pause, most of all). This is
+      // the last moment anything of ours is certain to run, so it is closed out
+      // here rather than left hanging (#140).
+      settleFade();
+      // Leaving the foreground is the last chance to write down where playback
+      // was, so this one is not up for skipping. For remote playback this must
+      // not force a queue rewrite: minimizing the app should not touch the
+      // current Sonos transport state.
+      syncQueueNow(true, false);
+      wentAway = Date.now();
+      markAway();
+      return;
+    }
+    clearAway();
+    // Back to foreground. The native `playbackStatusUpdate` heartbeat that feeds
+    // `positionSec`/`durationSec` can stall while backgrounded — especially right
+    // after a background auto-advance, where the freshly `replace()`d track never
+    // gets a tick until a manual pause/resume. Discrete events (track metadata,
+    // play/pause) still arrive, so the cover/title update but the scrubber stays
+    // frozen/empty. Pull the current status once here so position and duration
+    // are correct the instant the screen is shown; the heartbeat resumes on its
+    // own from now on.
+    const p = activePlayer();
+    if (p && !remoteKind()) {
+      try {
+        onStatus(p.currentStatus, true);
+      } catch {
+        // A stale native player can throw on read; the next heartbeat recovers.
+      }
+      // And say again what is playing. The notification's metadata is only ever
+      // pushed from here —nothing native refreshes it when the player moves on
+      // by itself— so a push that was missed while nobody was looking stayed
+      // missed, with the notification, the car and the watch describing an
+      // earlier track for as long as it kept playing. Coming back is the one
+      // moment we know the queue is being read again, and re-asserting it costs
+      // a single call.
+      const song = currentSong(usePlayerStore.getState());
+      if (song && lockOwner === p) applyLockScreen(p, song);
+    }
+    // And whatever was left on another player while this one was in a pocket.
+    // Coming back is the moment that matters for it: a phone rarely starts
+    // cold, so leaving this to the opening would mean it almost never ran.
+    // Not for a trip to another app and back, though: changing players takes
+    // longer than that, and this is a request.
+    if (Date.now() - wentAway > 30_000) void adoptNewerServerQueue();
+    // Still waiting out a dead connection: it did not come back while nobody
+    // was watching, so the stop becomes final now that somebody is — with
+    // the toast the background never showed.
+    if (bgWaiting) {
+      stopBgRetry();
+      usePlayerStore.setState({ isPlaying: false, isBuffering: false });
+      useToast.getState().show(tg("Couldn't play the song"));
+    }
+  });
+}
+
+/**
+ * Attaches remote output events (UPnP/DLNA) to the queue; see
+ * src/store/upnp.ts. Call once on startup.
+ */
+export function initRemoteIntegration() {
+  const events: RemoteEvents = {
+    onConnected: () => {
+      // Transfers the current track to the device and silences the local player.
+      const { queue, index, positionSec, isPlaying, sleepEndsAt } = usePlayerStore.getState();
+      cutCrossfade();
+      try {
+        activePlayer()?.pause();
+      } catch {
+        // ignore
+      }
+      resetUpnpRemoteSyncState();
+      clearLockScreen();
+      if (sleepEndsAt) {
+        const remainingSec = Math.max(0, Math.round((sleepEndsAt - Date.now()) / 1000));
+        void upnpSetSleepTimer(remainingSec);
+      }
+      const { crossfadeSec } = useSettings.getState();
+      void upnpSetCrossfade(crossfadeSec > 0);
+      if (queue[index]) void remoteLoadIndex(index, isPlaying, positionSec);
+    },
+    onTrackChanged: (reportedIndex, positionSec, durationSec, id) => {
+      const state = usePlayerStore.getState();
+      // By the song's id when the renderer's side knows it: found wherever it
+      // is in this queue, and nothing to do when it is the one on screen.
+      let index = reportedIndex;
+      if (id) {
+        if (state.queue[index]?.id !== id) index = state.queue.findIndex((s) => s.id === id);
+        if (index < 0) return;
+        if (index === state.index) return;
+      }
+      const song = state.queue[index];
+      if (!song) return;
+      // The same a local track change does: the renderer moved on by itself.
+      pushHistory();
+      consumeQueuedOnIndexChange(index);
+      resetListen();
+      usePlayerStore.setState({
+        index,
+        positionSec,
+        durationSec: plausibleDuration(durationSec, song.duration || state.durationSec, song.duration),
+      });
+      onTrackChanged(song);
+    },
+    onLost: (reason, deviceName) => {
+      const name = deviceName || 'UPnP';
+      useToast.getState().show(
+        reason === 'replaced'
+          ? tg('{name} is playing something else', { name })
+          : tg('Lost the connection to {name}', { name }),
+      );
+    },
+    onDisconnected: (lastPositionSec) => {
+      // The casting media session is already closed by `upnpDisconnect` (covers
+      // silent disconnects too). Here we just return to the local player.
+      const { queue, index } = usePlayerStore.getState();
+      const resume = resumeOnPhone;
+      resumeOnPhone = false;
+      resetUpnpRemoteSyncState();
+      if (!queue[index]) return;
+      void (async () => {
+        await loadIndex(index, false);
+        if (lastPositionSec > 0) seekActive(lastPositionSec);
+        usePlayerStore.setState({ positionSec: lastPositionSec, isPlaying: false });
+        if (resume) usePlayerStore.getState().toggle();
+      })();
+    },
+    onProgress: (positionSec, durationSec) => {
+      // The sleep timer's fallback for frozen JS timers is in `onStatus`, which
+      // casting returns from at once, and only Sonos keeps a timer of its own.
+      // The renderer's progress is the beat that does arrive with the screen
+      // off, so it is checked here too.
+      const endsAt = sleepDeadline();
+      if (endsAt && Date.now() >= endsAt) {
+        fireSleepTimer();
+        return;
+      }
+      const cur = usePlayerStore.getState();
+      usePlayerStore.setState({
+        positionSec,
+        // A renderer can be as wrong about it as the local player.
+        durationSec: plausibleDuration(durationSec, cur.durationSec, currentSong(cur)?.duration),
+      });
+      const st = usePlayerStore.getState();
+      maybeScrobbleThreshold(positionSec, st.isPlaying);
+      // Updates the casting notification/lock screen scrubber.
+      if (remoteKind()) castSetState(st.isPlaying, positionSec * 1000);
+    },
+    onPlayingChanged: (isPlaying, isBuffering) => {
+      usePlayerStore.setState({ isPlaying, isBuffering });
+      if (isPlaying) startPeriodicSync();
+      else {
+        stopPeriodicSync();
+        scheduleSync();
+      }
+      // Reflects play/pause in the casting media session.
+      if (remoteKind()) castSetState(isPlaying, usePlayerStore.getState().positionSec * 1000);
+    },
+    onRepeatChanged: (repeat) => {
+      const current = usePlayerStore.getState().repeat;
+      if (repeat === current) return;
+      usePlayerStore.setState({ repeat });
+      applyLoop(activePlayer());
+      scheduleSync();
+    },
+    onVolumeChanged: (volume) => {
+      const current = usePlayerStore.getState().volume;
+      const rounded = Math.round(volume * 100) / 100;
+      if (Math.abs(rounded - current) >= 0.01) {
+        usePlayerStore.setState({ volume: rounded });
+        castSetVolumeLevel(rounded);
+      }
+    },
+    onFinished: () => {
+      if (handleSleepAtSongEnd()) return;
+      const { repeat, index } = usePlayerStore.getState();
+      if (repeat === 'one') {
+        void remoteLoadIndex(index, true);
+        return;
+      }
+      const ni = nextIndex(false);
+      if (ni == null) {
+        usePlayerStore.setState({ isPlaying: false });
+      }
+      else void loadIndex(ni, true);
+    },
+  };
+  initUpnp(events);
+  initJukebox(events);
+  // The speaker is on the phone's own network, so casting goes back to the
+  // phone when the phone leaves it (#220). Only once that has lasted a moment,
+  // since hopping between access points passes through mobile data, and never
+  // for the internet dropping: the store's `connected` is about that, and a
+  // server and a speaker on the same LAN go on working without it.
+  const LEFT_LAN_GRACE_MS = 8000;
+  let leftLanTimer: ReturnType<typeof setTimeout> | undefined;
+  useNetworkType.subscribe(() => {
+    if (!isUpnpConnected()) return;
+    clearTimeout(leftLanTimer);
+    leftLanTimer = setTimeout(() => {
+      void offLocalNetwork().then((off) => {
+        if (off && isUpnpConnected()) void upnpDisconnect();
+      });
+    }, LEFT_LAN_GRACE_MS);
+  });
+  if (Platform.OS === 'ios') {
+    let lastMotionAllowed = motionNetworkAllowed();
+    const updateMotion = () => {
+      const allowed = motionNetworkAllowed();
+      if (allowed === lastMotionAllowed) return;
+      lastMotionAllowed = allowed;
+      const song = currentSong(usePlayerStore.getState());
+      if (song) publishAnimatedClip(song);
+    };
+    useNetworkType.subscribe(updateMotion);
+    useSettings.subscribe(updateMotion);
+  }
+  // Sync crossfade toggle to Sonos whenever the setting changes.
+  let lastCrossfadeSec = useSettings.getState().crossfadeSec;
+  useSettings.subscribe((s) => {
+    if (s.crossfadeSec !== lastCrossfadeSec) {
+      lastCrossfadeSec = s.crossfadeSec;
+      if (isUpnpConnected()) void upnpSetCrossfade(s.crossfadeSec > 0);
+    }
+  });
+  // Controls pressed in the notification/lock screen or volume buttons during
+  // casting: the store actions are already routed to the renderer (remoteKind()).
+  initCastMedia((action, value) => {
+    if (!remoteKind()) return;
+    const st = usePlayerStore.getState();
+    switch (action) {
+      case 'play':
+        if (!st.isPlaying) st.toggle();
+        break;
+      case 'pause':
+      case 'stop':
+        if (st.isPlaying) st.toggle();
+        break;
+      case 'next':
+        st.next();
+        break;
+      case 'previous':
+        st.previous();
+        break;
+      case 'seek':
+        if (value != null) st.seekTo(value / 1000);
+        break;
+      case 'volume':
+        // The system sends +1 / -1 per press; we move volume in steps.
+        st.setVolume(st.volume + (value ?? 0) * 0.05);
+        break;
+      default:
+        break;
+    }
+  });
+}
+
+interface PlayerState {
+  queue: Song[];
+  index: number;
+  /**
+   * Songs put straight after the current one by "Play next", still pending;
+   * they occupy positions index+1..index+queuedCount and are what the queue
+   * screen heads "Next in queue". "Add to queue" does not join them: it goes
+   * to the end of the whole queue (#184).
+   */
+  queuedCount: number;
+  isPlaying: boolean;
+  /** Audio is loading/buffering and not yet playing. */
+  isBuffering: boolean;
+  positionSec: number;
+  durationSec: number;
+  volume: number;
+  /**
+   * How fast what is playing runs, 1 being as recorded. Carries from one track
+   * to the next, which is the point of it (#151): you set it once and practise
+   * over a whole album.
+   *
+   * Survives closing the app with the saved queue, like shuffle and repeat
+   * (#325). While it is not 1 the player says so.
+   */
+  speed: number;
+  /**
+   * Varispeed (#277): the pitch moves with the speed, the way a record does on
+   * a turntable running fast or slow. Off by default, which keeps the pitch
+   * where it is (#151). Saved with the speed.
+   */
+  varispeed: boolean;
+  shuffle: boolean;
+  /**
+   * What is playing was dealt when it was started: the Shuffle button of an
+   * album or a playlist, which hands its list over shuffled once without
+   * turning the shuffle MODE on (see `playQueue`). The mode is the only thing
+   * that used to be known, so that button lit nothing and looked broken to
+   * whoever had just pressed it.
+   */
+  queueDealt: boolean;
+  repeat: RepeatMode;
+  originalQueue: Song[] | null;
+  /** When the sleep timer expires (ms epoch), or null if none. */
+  sleepEndsAt: number | null;
+  /** Pause at the end of the current track ("end of song" timer). */
+  sleepAtSongEnd: boolean;
+  /** Where the current queue came from (album, playlist, artist…), if known. */
+  source: string | null;
+  /** Origin path so we can navigate to it from the player. */
+  sourceHref: string | null;
+  /**
+   * The queue is a radio: it extends itself with similar tracks even if the
+   * autoplay setting is off, because you started it manually. Turned on by
+   * `startRadio`; any other queue (album, playlist…) turns it off.
+   */
+  radioMode: boolean;
+  /**
+   * The track the current mix was started from. Every extension is seeded from
+   * it, so the mix stays about that song instead of drifting batch by batch.
+   * Null when there's no mix (and on queues restored from the server, which has
+   * nowhere to carry it).
+   */
+  radioSeed: Song | null;
+  /**
+   * Track the internet radio playing right now says it is on, or null when
+   * there is no radio or the stream doesn't say. It changes on its own, without
+   * the queue changing (see `onStreamMetadata`).
+   */
+  streamInfo: StreamInfo | null;
+  playQueue: (
+    songs: Song[],
+    startIndex?: number,
+    source?: string,
+    sourceHref?: string,
+    opts?: {
+      /**
+       * What every "Shuffle" button asks for: this list dealt once, played in
+       * that order from the top (`startIndex` no longer means anything). It is
+       * NOT the shuffle mode, which is left exactly as it was found: the button
+       * used to turn it on, and since the mode survives restarts that made the
+       * next album you pressed play on come out shuffled too.
+       */
+      shuffled?: boolean;
+    },
+  ) => Promise<boolean>;
+  /**
+   * Starts a radio from a song: plays it immediately and the queue keeps
+   * filling itself with similar tracks, endlessly.
+   *
+   * Resolves once the first batch has been asked for, to whether the mix
+   * actually got tracks: a mix that found nothing must not be announced as
+   * started.
+   */
+  startRadio: (seed: Song, source: string) => Promise<boolean | null>;
+  /** Stops extending the queue. Doesn't touch it: finishes when it finishes. */
+  stopRadio: () => void;
+  /** At the very end of the queue, after everything (#184). */
+  addToQueue: (song: Song) => void;
+  /** Straight after the current song, at the front of the "queued" block. */
+  playNext: (song: Song) => void;
+  /**
+   * A whole record's worth at once, in the order given.
+   *
+   * Not the same as calling the two above in a loop: `playNext` puts each song
+   * where the last one went, so an album handed over song by song comes out
+   * backwards, and either way a queue of a hundred is a hundred separate
+   * changes for whatever is listening to them (the remote players sync on
+   * every one).
+   */
+  queueMany: (songs: Song[], where: 'next' | 'end') => void;
+  toggle: () => void;
+  next: () => void;
+  previous: () => void;
+  seekTo: (sec: number) => void;
+  setVolume: (v: number) => void;
+  /** Sets the playback speed (see `speed`). Heard right away, without
+   *  reloading anything. */
+  setSpeed: (v: number) => void;
+  /** Turns varispeed on or off (see `varispeed`). Heard right away. */
+  setVarispeed: (on: boolean) => void;
+  jumpTo: (index: number, kind?: JumpKind) => void;
+  /** Removes the song at `index`. Returns a function that reinserts it in its
+   *  place (for the "Undo" toast), except when removing the current one or
+   *  emptying. */
+  removeAt: (index: number) => Promise<(() => void) | undefined>;
+  moveTrack: (from: number, to: number) => void;
+  /** Saves the rating (1-5; 0 = unrated) in the queue copies. */
+  rateSong: (id: string, rating: number) => void;
+  /** Empties the queue leaving only the current song (keeps playing). Returns
+   *  a function that undoes the clear (for the "Undo" toast), or nothing if
+   *  there was no queue. */
+  clearQueue: () => (() => void) | undefined;
+  /** Real stop (long-press on play): stops and removes queue, mini player and
+   *  notification. Returns a function that undoes it (queue and position back,
+   *  paused), or nothing if nothing was playing. */
+  stopAndClear: () => Promise<(() => void) | undefined>;
+  toggleShuffle: () => void;
+  cycleRepeat: () => void;
+  setSleepTimer: (minutes: number) => void;
+  setSleepAtSongEnd: () => void;
+  cancelSleepTimer: () => void;
+  /**
+   * Restores the queue saved on the server (without playing).
+   *
+   * On a cold start it only fills a gap, since the copy on this device is the
+   * faithful one. `replace` is somebody asking for it on purpose — the queue
+   * they left on another player, brought over here — and then whatever is
+   * playing gives way to it. False when the server had nothing to give.
+   */
+  restoreFromServer: (replace?: boolean) => Promise<boolean>;
+  /** Restores the queue saved on this device (without playing).
+   *  Returns true if there was a local copy (even an intentionally emptied
+   *  queue): in that case the server backup should not enter. */
+  restoreFromStorage: () => Promise<boolean>;
+  /** Resumes the last queue: first the local copy; if none, the server's. */
+  restoreQueue: () => Promise<void>;
+  /** Reloads the current track against the active server URL, preserving
+   *  position and playback state. Called on network URL switch (the old
+   *  source stopped responding). Doesn't affect radio/local/downloaded. */
+  reloadCurrent: () => void;
+  /**
+   * Empties the queue and lets the player go. `forProfile` is the harder
+   * version, for when the account itself is changing: it also forgets shuffle
+   * and repeat, which belong to the profile that is leaving.
+   */
+  reset: (forProfile?: boolean) => Promise<void>;
+}
+
+/** What a stream announced it is playing. Its artist is often folded into the
+ *  title by the station, in which case it comes out of the split. */
+export interface StreamInfo {
+  title: string;
+  artist?: string;
+}
+
+/** Song currently playing, or null if the queue is empty. */
+export function currentSong(state: PlayerState): Song | null {
+  return state.queue[state.index] ?? null;
+}
+
+/**
+ * The song the mix now playing was built from, or null while what plays is
+ * still the queue's own album or playlist. Once playback crosses into the block
+ * autoplay appended, the header was still naming the album and linking to it
+ * (#65).
+ *
+ * Worked out rather than stored: the block goes on the end in one piece, so the
+ * song before it is the seed. That survives a restart with no field to persist,
+ * and skipping back puts the album's name back. Not for radios, where the whole
+ * queue is the mix.
+ */
+export function mixSeedOf(state: Pick<PlayerState, 'queue' | 'index'>): Song | null {
+  if (!state.queue[state.index]?.fromMix) return null;
+  let i = state.index;
+  // Songs added by hand land in the middle of the block without belonging to
+  // it, so the walk goes past them: otherwise the first one found would pass
+  // for the seed and the mix would be named after a song someone queued.
+  while (i > 0 && (state.queue[i - 1]?.fromMix || state.queue[i - 1]?.queued)) i--;
+  return state.queue[i - 1] ?? null;
+}
+
+/**
+ * The song playing was added to the queue by hand, so the header names the
+ * queue instead of the source (#65). Unlike a mix this undoes itself: it is a
+ * property of the song, and the next one that isn't yours puts the album back
+ * along with the way into it.
+ */
+export function playingQueued(state: Pick<PlayerState, 'queue' | 'index'>): boolean {
+  return !!state.queue[state.index]?.queued;
+}
+
+/**
+ * What `song`'s stream says it is playing, for the screens that show it. Null
+ * for anything that isn't a radio broadcasting metadata, and then the song's
+ * own title and artist are the whole story.
+ */
+export function useLiveInfo(song: Song | null | undefined): StreamInfo | null {
+  const info = usePlayerStore((s) => s.streamInfo);
+  // A podcast episode (vod) is a file, not a broadcasting station: its own
+  // title and artist are the whole story.
+  return song?.url && !song.vod ? info : null;
+}
+
+export const usePlayerStore = create<PlayerState>((set, get) => ({
+  queue: [],
+  index: 0,
+  queuedCount: 0,
+  isPlaying: false,
+  isBuffering: false,
+  positionSec: 0,
+  durationSec: 0,
+  volume: Platform.OS === 'web' ? readWebVolume() : 1,
+  speed: 1,
+  varispeed: false,
+  shuffle: false,
+  queueDealt: false,
+  repeat: 'off',
+  originalQueue: null,
+  sleepEndsAt: null,
+  sleepAtSongEnd: false,
+  source: null,
+  sourceHref: null,
+  radioMode: false,
+  radioSeed: null,
+  streamInfo: null,
+
+  playQueue: async (songs, startIndex = 0, source, sourceHref, opts) => {
+    if (songs.length === 0) return false;
+    // Discard offline-unavailable tracks (not downloaded): they can't be
+    // played. The initial index is remapped to the tapped song within the
+    // already-filtered list. Online never marks `unavailable`, so it doesn't change.
+    if (songs.some((s) => s.unavailable)) {
+      const tapped = songs[startIndex];
+      const playable = songs.filter((s) => !s.unavailable);
+      if (playable.length === 0) return false;
+      startIndex = tapped && !tapped.unavailable ? Math.max(0, playable.indexOf(tapped)) : 0;
+      songs = playable;
+    }
+    // Offline, a queue with nothing downloaded in it cannot be played at all,
+    // and it used to be set anyway: the mini player then showed a song that was
+    // never loaded, and pressing play resumed whatever had been loaded before
+    // it. Nothing is touched, so what was playing keeps playing.
+    if (useAuthStore.getState().offline && !songs.some(playableOffline)) {
+      useToast.getState().show(tg('Nothing here is downloaded'));
+      return false;
+    }
+    attachAppState();
+    autoplayFetchedFor = null;
+    autoplayRound = null;
+    // A new queue starts the artist's catalogue over, even the same artist's:
+    // what was handed over before is not in this queue.
+    artistFill = null;
+    resetWarmed();
+    // Before jumping to another list/album, save the current song in the
+    // "back" history so we can return to it (Spotify-style). Starting the list
+    // that is already playing is not a jump: there is nowhere to go back to,
+    // and what it kept of this list is about to stop existing.
+    const key = contextKey(source ?? null, sourceHref ?? null);
+    if (key) forgetHistoryOf(key);
+    if (!key || key !== contextKey(get().source, get().sourceHref)) pushHistory();
+    // Mark the source as recently listened (Library "Recents" order, Home grid).
+    // Its name travels with it: what was played is drawn from this alone when
+    // no list from the server happens to include it.
+    if (sourceHref) useLastPlayed.getState().touch(sourceHref, source);
+    // Two different things end up shuffled here. The Shuffle button hands the
+    // whole list over dealt, with no song picked, so nothing is pinned to the
+    // front. Shuffle MODE, on the other hand, is a way of listening rather than
+    // a property of one album: a list started while it is on keeps the song
+    // that was tapped first and deals the rest, which is what the mode's own
+    // button does, and turning the mode off afterwards puts the album back in
+    // its order — that is what `originalQueue` is for. Asking for both deals
+    // everything: there was no tapped song to keep.
+    const dealAll = opts?.shuffled && songs.length > 1;
+    const deal = !dealAll && get().shuffle && songs.length > 1;
+    const first = songs[startIndex];
+    const queued = dealAll
+      ? dealt(songs)
+      : deal
+        ? [first, ...dealt(songs.filter((_, i) => i !== startIndex))]
+        : songs;
+    const at = dealAll || deal ? 0 : startIndex;
+    // What is on screen right now, kept in case the new queue never manages to
+    // play. The list goes in before it is loaded on purpose, since that is what
+    // makes tapping a song feel immediate, but a load that fails used to leave
+    // it there: the app showing one song, the speakers still on the last one,
+    // and nothing to say which was which (@ztx-lyghters). Whatever is put back
+    // is what is actually playing, so the two agree again.
+    const before = {
+      queue: get().queue,
+      index: get().index,
+      queuedCount: get().queuedCount,
+      positionSec: get().positionSec,
+      durationSec: get().durationSec,
+      originalQueue: get().originalQueue,
+      queueDealt: get().queueDealt,
+      source: get().source,
+      sourceHref: get().sourceHref,
+      radioMode: get().radioMode,
+      radioSeed: get().radioSeed,
+    };
+    queueOrigin = null;
+    // The list goes up before it is loaded, and the store subscription warms
+    // what follows it at that same moment.
+    const tapped = queued[at];
+    const hold = tapped && !tapped.url && !localSourceFor(tapped) && !remoteKind() ? holdSpeculation() : undefined;
+    set({
+      queue: queued,
+      index: at,
+      queuedCount: 0,
+      positionSec: 0,
+      durationSec: 0,
+      originalQueue: deal ? songs : null,
+      // Both ways of dealing count: the Shuffle button of the list (`dealAll`)
+      // and tapping a song with the mode already on.
+      queueDealt: dealAll || deal,
+      source: source ?? null,
+      sourceHref: sourceHref ?? null,
+      // Any normal queue turns off the radio; `startRadio` turns it back on.
+      radioMode: false,
+      radioSeed: null,
+    });
+    // Only when there was something to go back to: with nothing playing before,
+    // an empty queue says less than the one that failed, and the toast has
+    // already said what happened.
+    const ok = await loadIndex(at, true);
+    if (!ok) {
+      if (hold !== undefined) releaseSpeculation(hold);
+      if (before.queue.length > 0) set(before);
+    }
+    return ok;
+  },
+
+  startRadio: async (seed, source) => {
+    const cur = currentSong(get());
+    if (cur && cur.id === seed.id) {
+      // Mix seeded by what's already playing: only the queue AROUND it changes,
+      // so we swap the context without touching the player. Going through
+      // `playQueue` would `replace()` the source and throw the track back to
+      // 0:00, which is not what "start mix" means when you're already listening
+      // to that song. We keep `cur` (not `seed`) in the queue: same song, but
+      // the object the player is already loaded with.
+      pushHistory();
+      autoplayFetchedFor = null;
+      autoplayRound = null;
+      artistFill = null;
+      resetWarmed();
+      set({
+        queue: [cur],
+        index: 0,
+        queuedCount: 0,
+        shuffle: false,
+        // Off, for the same reason shuffle is: a mix is an endless line of
+        // tracks arriving, and the two playback modes that rearrange a queue
+        // with an end have nothing to say about one without. `one` is the case
+        // that made this worth doing rather than tidy, since it would hold the
+        // seed on screen for ever with the whole mix waiting behind it (#197).
+        repeat: 'off',
+        queueDealt: false,
+        originalQueue: null,
+        source,
+        sourceHref: null,
+        radioMode: true,
+        radioSeed: cur,
+      });
+      // The player is already loaded and was told to loop when it was, so
+      // turning repeat off in the state above is not enough on its own: the
+      // track would go round again while the mix waited behind it.
+      applyLoop(activePlayer());
+      // `loadIndex` isn't running, so nothing else is going to persist this.
+      scheduleSync();
+      await maybeQueueAutoplay();
+      return get().queue.length > 1;
+    }
+    // Play the seed immediately and similar tracks are requested later: waiting
+    // for the server to respond before pressing play would make "start mix" feel
+    // broken. Awaiting `maybeQueueAutoplay` afterwards doesn't delay playback,
+    // only the answer of whether the mix found anything.
+    //
+    // Repeat goes off before the seed is loaded rather than after, so the load is the thing
+    // that tells the player (`applyLoop` reads the state as it goes), and
+    // `playQueue` writes it down with the rest of the queue.
+    set({ repeat: 'off' });
+    // A seed that did not load leaves the queue as it was (`playQueue` puts it
+    // back), and turning that into a mix made the album before it grow with
+    // songs like one that never played. The load has already said why.
+    if (!(await get().playQueue([seed], 0, source))) return null;
+    set({ radioMode: true, radioSeed: seed });
+    await maybeQueueAutoplay();
+    return get().queue.length > 1;
+  },
+
+  stopRadio: () => {
+    set({ radioMode: false, radioSeed: null });
+    saveQueueLocal();
+  },
+
+  /**
+   * The end of the queue, and it means the end (#184).
+   *
+   * It used to land at the back of the "queued" block, which is where Spotify
+   * puts it — but Spotify has no "Play next" beside it. With both in the menu,
+   * one going after the current song and the other one place further along is
+   * a distinction nobody can see and a name that does not describe itself: the
+   * report was somebody adding a record and finding it before the rest of the
+   * one already playing. Every player that offers the pair reads it this way
+   * (Apple Music's "Play Last", Feishin's `Play.LAST`).
+   *
+   * The block is left alone: what is in it was put there by "Play next", and
+   * this song is not joining it.
+   *
+   * Adding one from the queue itself hands back the very object that is in it,
+   * mark and all, so a song picked out of a mix would have carried the mark
+   * into the middle of an album and taken the header with it (`handAdded`).
+   */
+  addToQueue: (song) => {
+    const { queue } = get();
+    if (queue.length === 0) {
+      void get().playQueue([song], 0);
+      return;
+    }
+    set({ queue: appendEnd(queue, [song]) });
+    scheduleSync();
+  },
+
+  playNext: (song) => {
+    const st = get();
+    if (st.queue.length === 0) {
+      void get().playQueue([song], 0);
+      return;
+    }
+    set(insertNext(st, [song]));
+    scheduleSync();
+  },
+
+  queueMany: (songs, where) => {
+    if (songs.length === 0) return;
+    const st = get();
+    // Nothing playing: this is not a queue to add to, it is the queue.
+    if (st.queue.length === 0) {
+      void get().playQueue(songs, 0);
+      return;
+    }
+    set(where === 'end' ? { queue: appendEnd(st.queue, songs) } : insertNext(st, songs));
+    scheduleSync();
+  },
+
+  toggle: () => {
+    // The one press that does not change track: what was restored is about to
+    // be heard, so what the opening held back is due now. A press owns the
+    // player again, so a background wait (if any) ends here.
+    stopBgRetry();
+    gaveUp = null;
+    endBootQuiet(true);
+    if (remoteKind()) {
+      if (get().isPlaying) {
+        remotePause();
+        set({ isPlaying: false });
+      } else {
+        remotePlay();
+        set({ isPlaying: true });
+      }
+      return;
+    }
+    const p = activePlayer();
+    if (!p) {
+      // No player yet: the restored queue never got as far as loading a track,
+      // which offline means none of it is on disk. Going through `loadIndex`
+      // plays what can be played, and says so when nothing can.
+      const { queue, index } = get();
+      if (queue[index]) void loadIndex(index, true);
+      return;
+    }
+    // Effective volume of the current track (user × ReplayGain).
+    const vol = effectiveVolume(currentSong(get()));
+    if (get().isPlaying) {
+      // Pausing mid-fade cuts the outgoing: on resume only the current track
+      // should play, at normal volume.
+      cutCrossfade();
+      set({ isPlaying: false });
+      const stop = () => {
+        try {
+          p.pause();
+          // Reconcile in case volume changed during the ramp; this way a later
+          // play (including system/lock screen) sounds at the real volume.
+          p.volume = effectiveVolume(currentSong(get()));
+        } catch {
+          // ignore
+        }
+        scheduleSync(); // the "on pause" sync that onStatus does
+      };
+      // Lower volume and pause when done; leaves volume restored so a later
+      // play (including system/lock screen) sounds normal. Backgrounded there
+      // is no ramp to wait on: the pause is what matters and it happens now.
+      if (canFade()) fadeVolume(p, vol, 0, stop);
+      else stop();
+    } else if (playerFailed) {
+      // Sitting on a failure, where `play()` would flip the button and sound
+      // nothing: install the track again at the second it stopped. Offline
+      // with nothing on the phone, that says so instead of pretending, and
+      // waits for the network like a failure does.
+      const songId = currentSong(get())?.id;
+      void reloadCurrent(get().positionSec, true).then((loaded) => {
+        if (!loaded && songId) waitForNetwork(songId);
+      });
+    } else {
+      const ramp = canFade();
+      // Start silent and ramp up: fade-in on resume. Backgrounded it starts at
+      // its own volume instead, because nothing would raise it afterwards.
+      try {
+        p.volume = ramp ? 0 : vol;
+      } catch {
+        // ignore
+      }
+      p.play();
+      set({ isPlaying: true });
+      if (ramp) {
+        fadeVolume(p, 0, vol, () => {
+          try {
+            p.volume = effectiveVolume(currentSong(get()));
+          } catch {
+            // ignore
+          }
+        });
+      }
+    }
+  },
+
+  next: () => {
+    endBootQuiet();
+    const ni = nextIndex(true);
+    if (ni != null) {
+      pushHistory();
+      void loadIndex(ni, skipAutoplay(get().isPlaying));
+      return;
+    }
+    // Offline with songs still ahead, none of them on the phone: the press did
+    // nothing and said nothing, which reads as a broken button.
+    const { queue, index } = get();
+    if (useAuthStore.getState().offline && index < queue.length - 1) {
+      useToast.getState().show(tg('Nothing here is downloaded'));
+    }
+  },
+
+  previous: () => {
+    endBootQuiet();
+    const { index, positionSec } = get();
+    // Like Spotify: past a few seconds, "previous" restarts the song. In
+    // "always" mode (YouTube-style) it always goes to the previous track, no restart.
+    if (useSettings.getState().previousButtonMode !== 'always' && positionSec > 3) {
+      get().seekTo(0);
+      return;
+    }
+    const playing = get().isPlaying;
+    // Step backwards within the current queue as long as we're not at the first track.
+    if (index > 0) {
+      void loadIndex(index - 1, skipAutoplay(playing));
+      return;
+    }
+    // At the start of the queue: return to the previous context from history.
+    // Entries of this same list point further into it, left there by the
+    // advances the steps above walked back over.
+    const { queue, source, sourceHref } = get();
+    const key = contextKey(source, sourceHref);
+    const sameList = (e: HistoryEntry) =>
+      e.queue === queue || (key != null && contextKey(e.source, e.sourceHref) === key);
+    let entry = playedHistory.pop();
+    while (entry && sameList(entry)) entry = playedHistory.pop();
+    if (entry) {
+      set({
+        queue: entry.queue,
+        index: entry.index,
+        source: entry.source,
+        sourceHref: entry.sourceHref,
+        originalQueue: entry.originalQueue,
+        shuffle: entry.shuffle,
+        queueDealt: entry.queueDealt,
+        queuedCount: 0,
+        positionSec: 0,
+        durationSec: 0,
+      });
+      void loadIndex(entry.index, skipAutoplay(playing));
+      return;
+    }
+    get().seekTo(0);
+  },
+
+  seekTo: (sec) => {
+    // A second of this song, and nothing else. The app's own slider cannot hand
+    // over anything but that, and the car can: what reaches here from there is
+    // whatever media3 gave the session, which is not always a time (see the car
+    // module's `handleSeek`). A position the player cannot answer is not a seek
+    // that goes nowhere, it is a player that stops.
+    if (!Number.isFinite(sec)) return;
+    const duration = get().durationSec;
+    // A radio has no length to stay inside of, and a stream still loading has
+    // not said its own yet.
+    const target = Math.max(0, duration > 0 ? Math.min(sec, duration) : sec);
+    cutCrossfade();
+    if (remoteKind()) {
+      remoteSeek(target);
+      set({ positionSec: target });
+    } else {
+      seekActive(target);
+    }
+    // The server works out the position between reports by letting the clock
+    // run, so a jump nobody told it about leaves its panel counting from where
+    // the song no longer is.
+    const st = get();
+    reportState(st.isPlaying ? 'playing' : 'paused', st.queue[st.index], target);
+  },
+
+  setVolume: (v) => {
+    if (!Number.isFinite(v)) return;
+    const volume = Math.max(0, Math.min(1, v));
+    set({ volume });
+    if (Platform.OS === 'web') saveWebVolume(volume);
+    if (remoteKind()) remoteSetVolume(volume);
+    else if (!fadingOut && !pauseFadeTimer) {
+      // Mid-fade (crossfade or pause/resume) don't step on the ramp: it
+      // converges on its own and volume is restored when done.
+      const p = activePlayer();
+      if (p) p.volume = effectiveVolume(currentSong(get()));
+    }
+  },
+
+  setSpeed: (v) => {
+    // The ends of what is offered. Android clamps to 0.1–2 on its own, and a
+    // rate that came back clamped would leave the list showing a speed that is
+    // not the one playing.
+    // To the hundredth: that is the slider's step (#277), and a float that is
+    // not quite 1.03 would be shown as one.
+    const speed = Math.round(Math.min(2, Math.max(0.5, v)) * 100) / 100;
+    set({ speed });
+    // Only the player that is sounding: the reserve gets it when a source is
+    // installed on it, and a remote renderer plays at its own pace.
+    if (!remoteKind()) applySpeed(activePlayer(), currentSong(get()));
+  },
+
+  setVarispeed: (on) => {
+    set({ varispeed: on });
+    if (!remoteKind()) applySpeed(activePlayer(), currentSong(get()));
+  },
+
+  jumpTo: (index, kind = 'pick') => {
+    endBootQuiet();
+    const { queue } = get();
+    if (index < 0 || index >= queue.length) return;
+    // Forward jump like any other: "previous" must be able to return.
+    pushHistory();
+    void loadIndex(index, kind === 'skip' ? skipAutoplay(get().isPlaying) : true);
+  },
+
+  removeAt: async (index) => {
+    const removal = removeFrom(get(), index);
+    if (!removal) return undefined;
+    const removed = get().queue[index];
+    const { state: next, inQueuedBlock } = removal;
+    if (next.queue.length === 0) {
+      clearQueueLocal();
+      await get().reset();
+      return undefined;
+    }
+    set(next);
+    if (removal.wasCurrent) {
+      await loadIndex(next.index, get().isPlaying);
+      scheduleSync();
+      return undefined;
+    }
+    scheduleSync();
+    return () => {
+      // Only if the queue hasn't changed since then (same reference; auto-advance
+      // does not replace it, so the index is adjusted).
+      const st = get();
+      if (st.queue !== next.queue) return;
+      set(restoreRemoved(st, index, removed, inQueuedBlock));
+      scheduleSync();
+    };
+  },
+
+  clearQueue: () => {
+    const { queue, index, queuedCount, originalQueue, radioMode, radioSeed } = get();
+    const current = queue[index];
+    if (!current) return undefined;
+    // Clearing also turns off the radio. Otherwise it'd be zombie: autoplay only
+    // triggers when STARTING a song, and after clearing none starts, so the icon
+    // would say "radio active" on a radio that would never extend.
+    set({
+      queue: [current],
+      index: 0,
+      queuedCount: 0,
+      originalQueue: null,
+      radioMode: false,
+      radioSeed: null,
+    });
+    scheduleSync();
+    return () => {
+      // Only if the queue is still as the clear left it (nothing new was put on).
+      const st = get();
+      if (st.queue.length !== 1 || st.queue[0]?.id !== current.id) return;
+      set({ queue, index, queuedCount, originalQueue, radioMode, radioSeed });
+      scheduleSync();
+    };
+  },
+
+  stopAndClear: async () => {
+    const {
+      queue,
+      index,
+      positionSec,
+      queuedCount,
+      originalQueue,
+      shuffle,
+      source,
+      sourceHref,
+      radioMode,
+      radioSeed,
+    } = get();
+    if (queue.length === 0) return undefined;
+    // Deliberate stop: also forget the saved copy, so the queue doesn't
+    // reappear on app reopen.
+    clearQueueLocal();
+    await get().reset();
+    return () => {
+      void (async () => {
+        // Only if nothing new was started playing in the meantime.
+        if (get().queue.length > 0) return;
+        attachAppState();
+        set({
+          queue,
+          index,
+          positionSec,
+          durationSec: queue[index]?.duration ?? 0,
+          isPlaying: false,
+          queuedCount,
+          originalQueue,
+          shuffle,
+          source,
+          sourceHref,
+          radioMode,
+          radioSeed,
+        });
+        // Like restoring the saved queue: track loaded, paused.
+        await loadIndex(index, false);
+        if (positionSec > 0) seekActive(positionSec);
+        usePlayerStore.setState({ positionSec, isPlaying: false });
+        scheduleSync();
+      })();
+    };
+  },
+
+  rateSong: (id, rating) => {
+    const patch = (list: Song[]) =>
+      list.map((s) => (s.id === id ? { ...s, userRating: rating } : s));
+    const { queue, originalQueue } = get();
+    set({
+      queue: patch(queue),
+      originalQueue: originalQueue ? patch(originalQueue) : null,
+    });
+    // Reflect the rating in already-loaded lists (album, playlist, favorites,
+    // search): all expose `songs: Song[]`. Optimistic patch in the React Query
+    // cache so the change is visible instantly without re-requesting from server.
+    queryClient.setQueriesData({ predicate: () => true }, (data: unknown) => {
+      if (!data || typeof data !== 'object') return data;
+      const songs = (data as { songs?: Song[] }).songs;
+      if (!Array.isArray(songs) || !songs.some((s) => s.id === id)) return data;
+      return { ...data, songs: patch(songs) };
+    });
+  },
+
+  moveTrack: async (from, to) => {
+    const next = moveIn(get(), from, to);
+    if (!next) return;
+    set(next);
+    scheduleSync();
+  },
+
+  toggleShuffle: () => {
+    const { shuffle, queue, index, originalQueue, source, sourceHref } = get();
+    const current = queue[index];
+    const upnpActive = remoteKind() === 'upnp';
+    // Same reasoning as starting a list again (see `forgetHistoryOf`): the
+    // order changes under the list being played, so where the back history had
+    // you in it no longer means anything. Left in, ⏮️ restored one of those
+    // positions along with the shuffle it was taken with, which turned the
+    // button you had just pressed back off by itself.
+    const key = contextKey(source, sourceHref);
+    if (key) forgetHistoryOf(key);
+
+    if (!shuffle) {
+      // `originalQueue` keeps the marks that shuffling takes off.
+      set({
+        shuffle: true,
+        queueDealt: true,
+        originalQueue: queue,
+        ...shuffleOn(queue, index, upnpActive),
+        queuedCount: 0,
+      });
+    } else if (originalQueue && current) {
+      set({
+        shuffle: false,
+        queueDealt: false,
+        ...unshuffled(queue, originalQueue, current),
+        originalQueue: null,
+        queuedCount: 0,
+      });
+    } else {
+      set({ shuffle: false, queueDealt: false, originalQueue: null, queuedCount: 0 });
+    }
+    scheduleSync();
+  },
+
+  cycleRepeat: () => {
+    // First tap: repeat current song ('one'); second: whole queue ('all');
+    // third: off. Like Feishin.
+    const order: RepeatMode[] = ['off', 'one', 'all'];
+    const repeat = order[(order.indexOf(get().repeat) + 1) % order.length];
+    set({ repeat });
+    applyLoop(activePlayer());
+    // It travels with the queue now, so it is written down like the rest of it
+    // instead of waiting for the next thing that happens to save.
+    scheduleSync();
+  },
+
+  setSleepTimer: (minutes) => {
+    if (sleepTimeout) clearTimeout(sleepTimeout);
+    sleepTimeout = setTimeout(fireSleepTimer, minutes * 60_000);
+    armSleepFade(minutes * 60_000);
+    if (remoteKind() === 'upnp') void upnpSetSleepTimer(minutes * 60);
+    set({ sleepEndsAt: Date.now() + minutes * 60_000, sleepAtSongEnd: false });
+  },
+
+  setSleepAtSongEnd: () => {
+    if (sleepTimeout) clearTimeout(sleepTimeout);
+    sleepTimeout = null;
+    // No fade: the song ends on its own, and fading its end would ruin exactly
+    // what was asked to be heard in full.
+    abortSleepFade();
+    if (remoteKind() === 'upnp') void upnpSetSleepTimer(null);
+    set({ sleepEndsAt: null, sleepAtSongEnd: true });
+    syncJukeboxUpcoming();
+  },
+
+  cancelSleepTimer: () => {
+    if (sleepTimeout) clearTimeout(sleepTimeout);
+    sleepTimeout = null;
+    abortSleepFade();
+    if (remoteKind() === 'upnp') void upnpSetSleepTimer(null);
+    set({ sleepEndsAt: null, sleepAtSongEnd: false });
+    syncJukeboxUpcoming();
+  },
+
+  restoreFromServer: async (replace = false) => {
+    const { auth, offline } = useAuthStore.getState();
+    if (!auth || offline || (!replace && get().queue.length > 0)) return false;
+    let saved;
+    try {
+      saved = await getPlayQueue(auth);
+    } catch {
+      return false;
+    }
+    if (!saved || saved.entries.length === 0) return false;
+    const songs = saved.entries;
+    const index = saved.current
+      ? Math.max(0, songs.findIndex((s) => s.id === saved.current))
+      : 0;
+    const positionSec = (saved.position ?? 0) / 1000;
+    // If something already started playing in the meantime, don't override the
+    // queue — unless overriding it is the whole request.
+    if (!replace && get().queue.length > 0) return false;
+    attachAppState();
+    // This queue is the server's word and not this device's, so it is not
+    // pushed back until something is actually played from it (see
+    // `playedHere`). Otherwise adopting a queue and putting the phone away
+    // wrote it straight back, stamped with our name.
+    clearPlayedHere();
+    queueOrigin = 'server queue';
+    set({
+      queue: songs,
+      index,
+      positionSec,
+      durationSec: songs[index]?.duration ?? 0,
+      isPlaying: false,
+      source: null,
+      sourceHref: null,
+      // The server queue is pure Subsonic: it has no place to carry this, so
+      // a radio recovered from there stops being one. The local copy does save
+      // it, and it's tried first (see `restoreQueue`). Same for a queue that
+      // was dealt: what comes back is an order, with nothing to say it was one.
+      radioMode: false,
+      radioSeed: null,
+      queueDealt: false,
+    });
+    // Load the track (without playing) and leave the position ready.
+    await loadIndex(index, false);
+    // A tap that landed while this was loading owns the player now (`loadToken`
+    // saw to that). What is left here belongs to the queue being restored, and
+    // running it against another one would drop somebody else's song at the
+    // position this one was left at, paused.
+    if (get().queue !== songs) return true;
+    if (positionSec > 0) seekActive(positionSec);
+    usePlayerStore.setState({ positionSec, isPlaying: false });
+    return true;
+  },
+
+  restoreFromStorage: async () => {
+    const key = queueStorageKey();
+    if (!key || get().queue.length > 0) return true;
+    let saved: StoredQueue | null = null;
+    try {
+      const raw = await getItem(key);
+      saved = raw ? (JSON.parse(raw) as StoredQueue) : null;
+    } catch {
+      return false;
+    }
+    if (!saved || !Array.isArray(saved.queue)) return false;
+    // What the comparison with the server's copy is made against.
+    localSavedAt = saved.savedAt ?? 0;
+    // Saved empty queue = the user emptied it on purpose: nothing to
+    // restore, but the server backup should also not enter. How they were
+    // listening does come back: it outlived the queue while the app was open,
+    // and there is no reason for it to stop doing so because the app was
+    // closed.
+    if (saved.queue.length === 0) {
+      set({
+        shuffle: saved.shuffle === true,
+        queueDealt: false,
+        repeat: isRepeatMode(saved.repeat) ? saved.repeat : 'off',
+        ...savedSpeed(saved),
+      });
+      return true;
+    }
+    // If something already started playing in the meantime, don't override the queue.
+    if (get().queue.length > 0) return true;
+    const index = Math.min(Math.max(0, saved.index ?? 0), saved.queue.length - 1);
+    // An episode's own record is newer: the queue is rewritten far less often.
+    const positionSec =
+      (await storedEpisodeResume(saved.queue[index])) ??
+      (typeof saved.positionSec === 'number' && Number.isFinite(saved.positionSec)
+        ? Math.max(0, saved.positionSec)
+        : 0);
+    if (get().queue.length > 0) return true;
+    attachAppState();
+    queueOrigin = 'saved queue';
+    set({
+      queue: saved.queue,
+      index,
+      positionSec,
+      durationSec: saved.queue[index]?.duration ?? 0,
+      isPlaying: false,
+      // Restored like `radioMode`: without this the "playing from" header
+      // vanished once Android killed the app in the background and the queue
+      // came back from disk.
+      source: typeof saved.source === 'string' ? saved.source : null,
+      sourceHref: typeof saved.sourceHref === 'string' ? saved.sourceHref : null,
+      // If it was a radio, it still is: closing the app should not leave it
+      // silent when reaching the end of what was already queued.
+      radioMode: saved.radioMode === true,
+      radioSeed: saved.radioSeed ?? null,
+      // The queue was saved already shuffled, so this only restores the button:
+      // nothing is reordered on the way back in. `originalQueue` stays null
+      // (see `StoredQueue`), which turning shuffle off handles on its own.
+      shuffle: saved.shuffle === true,
+      queueDealt: saved.dealt === true,
+      repeat: isRepeatMode(saved.repeat) ? saved.repeat : 'off',
+      ...savedSpeed(saved),
+    });
+    await loadIndex(index, false);
+    // Same as the server restore above: only if this queue is still the one.
+    if (get().queue !== saved.queue) return true;
+    if (positionSec > 0) seekActive(positionSec);
+    usePlayerStore.setState({ positionSec, isPlaying: false });
+    return true;
+  },
+
+  restoreQueue: async () => {
+    // Everything speculative stays out of the way until the app is up (see
+    // `startBootQuiet`): what comes back here is a queue nobody has asked to
+    // hear yet.
+    startBootQuiet();
+    // The local copy is the most faithful (includes downloads, radios and
+    // offline mode); the server one is a backup for fresh sessions —
+    // except when the local copy says the queue was emptied on purpose.
+    //
+    // Timed as one: it reads the saved queue out of SecureStore, up to five
+    // hundred songs of it, and loads its track into the player. That is the
+    // last thing the opening waits for.
+    await timed('boot queue', async () => {
+      const handled = await get().restoreFromStorage();
+      if (!handled && get().queue.length === 0) {
+        await get().restoreFromServer();
+        return;
+      }
+      // Not awaited, and not now: it is a whole queue coming down the wire and
+      // the first screens are asking for what they draw (#50). It replaces this
+      // one only if it turns out to be newer, and only while nobody has started
+      // listening here.
+      setTimeout(() => void adoptNewerServerQueue(), 4000);
+    });
+  },
+
+  reloadCurrent: () => {
+    const { queue, index, positionSec, isPlaying } = get();
+    const song = queue[index];
+    // Radio (own url) and anything playing from disk sound the same whatever
+    // the server URL is, so there is nothing to reload against a new one.
+    if (!song || song.url || localSourceFor(song)) return;
+    // Cast (UPnP) carries its own session; don't touch it.
+    if (remoteKind()) return;
+    // Paused, there's no audio to preserve: abrupt reload, simpler and safer.
+    // Playing, seamless handoff against the new host (see `handoffToNewSource`).
+    if (isPlaying) handoffToNewSource(index, song, positionSec);
+    else hardReload(index, positionSec, false);
+  },
+
+  reset: async (forProfile = false) => {
+    get().cancelSleepTimer();
+    clearPlayedHere();
+    autoplayFetchedFor = null;
+    autoplayRound = null;
+    artistFill = null;
+    similarArtistsCache = null;
+    stopPeriodicSync();
+    if (syncTimer) {
+      clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    // On reset (profile change/exit) the remote output is cut without
+    // resuming locally: the queue is going away anyway.
+    if (remoteKind() === 'upnp') void upnpDisconnect(true);
+    else if (remoteKind() === 'jukebox') void jukeboxDisconnect(true);
+    cutCrossfade();
+    try {
+      activePlayer()?.pause();
+    } catch {
+      // ignore
+    }
+    clearLockScreen();
+    playedHistory = [];
+    setStreamOffset(0);
+    sourceHasLength = null;
+    resetListen();
+    // timeOffset support is per server: re-check on change. The one in flight
+    // goes with it, or the next profile would be handed this one's answer.
+    transcodeOffsetSupported = null;
+    transcodeOffsetAsking = null;
+    // What failed to play belonged to the queue that is going away, and song
+    // ids are only unique within the account that issued them.
+    failedSource.clear();
+    errorTrackId = null;
+    errorAttempts = 0;
+    set({
+      queue: [],
+      index: 0,
+      queuedCount: 0,
+      isPlaying: false,
+      isBuffering: false,
+      positionSec: 0,
+      durationSec: 0,
+      // Shuffle and repeat are how somebody listens, not something a queue
+      // owns, and they already survive closing the app (#102). Emptying the
+      // queue is a smaller event than that, so it cannot be the one that
+      // forgets them: holding Play to clear was turning both off, and turning
+      // them back on by hand afterwards is exactly the chore #102 was about.
+      // Changing account is the real exception, since the mode being restored
+      // belongs with the other profile's queue.
+      // The speed goes with them, and for the same reason: it is about
+      // listening, not about this queue.
+      ...(forProfile ? { shuffle: false, repeat: 'off' as const, speed: 1, varispeed: false } : {}),
+      // Not one of those two: this is about the queue that is going away, not
+      // about how somebody listens.
+      queueDealt: false,
+      originalQueue: null,
+      source: null,
+      sourceHref: null,
+      radioMode: false,
+      radioSeed: null,
+    });
+    // After the `set`, not before: emptying the queue is what sends the
+    // "stopped" from the subscription below, and it needs the answer this
+    // profile already gave. Support is per server, so the next account asks
+    // again.
+    playbackReportSupported = null;
+    playbackReportAsking = null;
+  },
+}));
+
+// Gapless: what comes next changes with the queue, the position in it, the
+// repeat mode and the "stop at end of song" timer. Watching the store beats
+// hooking every action that touches them (add to queue, reorder, remove,
+// shuffle, autoplay…), where the queued track would go stale by omission.
+usePlayerStore.subscribe((st, prev) => {
+  if (
+    st.queue !== prev.queue ||
+    st.index !== prev.index ||
+    st.repeat !== prev.repeat ||
+    st.sleepAtSongEnd !== prev.sleepAtSongEnd
+  ) {
+    // A replaced queue is a new walk, and the covers the last one had under
+    // way are not this one's: asking again is cheap (the native side
+    // remembers its own), and it is what re-warms a cover the native cache
+    // has since dropped.
+    if (st.queue !== prev.queue) warmedArtwork.clear();
+    scheduleNextSource();
+    // What is coming has moved, so the warming window has too. Queueing the
+    // next source is not this: that hands the track to the player, which
+    // decides for itself when to start buffering it, and it does so near the
+    // end of the one playing. This is the request that reaches the server now,
+    // which is the point on a proxy that has to fetch the file from somewhere
+    // else first. Cheap when nothing changed: it is off unless asked for, and
+    // it remembers what it has already warmed.
+    warmUpcoming();
+    cacheUpcoming();
+  }
+  // Pausing, resuming and stopping, told to the server (see `reportState`).
+  // Watching the store is what makes this cover every way playback stops: the
+  // button, the notification, the headphones, the sleep timer, the car, and the
+  // long press on Play that empties the queue. Hooking the actions instead left
+  // whichever one was added last reporting nothing.
+  if (st.queue.length === 0 && prev.queue.length > 0) {
+    // The queue emptied: that is over, not paused. Read from `prev`, since
+    // there is no longer a song here to name.
+    reportState('stopped', prev.queue[prev.index], prev.positionSec);
+  } else if (st.isPlaying !== prev.isPlaying) {
+    reportState(st.isPlaying ? 'playing' : 'paused', st.queue[st.index], st.positionSec);
+  }
+  // What the saved queue holds, position aside (see `queueDirty`).
+  if (
+    st.queue !== prev.queue ||
+    st.index !== prev.index ||
+    st.source !== prev.source ||
+    st.sourceHref !== prev.sourceHref ||
+    st.radioMode !== prev.radioMode ||
+    st.radioSeed !== prev.radioSeed ||
+    st.shuffle !== prev.shuffle ||
+    st.repeat !== prev.repeat ||
+    st.speed !== prev.speed ||
+    st.varispeed !== prev.varispeed
+  ) {
+    queueDirty = true;
+  }
+});
+
+// A song starred or unstarred anywhere in the app: the heart outside it follows.
+onFavoritesChange(() => {
+  const p = activePlayer();
+  const song = currentSong(usePlayerStore.getState());
+  if (p && song && lockOwner === p) applyLockScreenFavorite(p, song);
+});

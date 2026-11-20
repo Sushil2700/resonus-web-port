@@ -1,0 +1,23 @@
+// Browser equivalent of the native file store. URLs remain stable across reloads;
+// the service worker serves cached audio (including byte ranges) and artwork.
+export const documentDirectory = typeof location === 'undefined' ? '/__files__/' : location.origin + '/__files__/';
+export const cacheDirectory = documentDirectory + 'cache/';
+export const EncodingType = {Base64:'base64',UTF8:'utf8'};
+export const fileSizes = new Map<string,number>();
+const cache = () => caches.open('resonus-files-v1');
+const url = (uri:string) => new URL(uri,location.origin).href;
+export async function getInfoAsync(uri:string) {const c=await cache(),r=await c.match(url(uri));if(r){const size=(await r.blob()).size;fileSizes.set(uri,size);return {exists:true,isDirectory:false,uri,size,modificationTime:Number(r.headers.get('x-modified')||0)}};const keys=await c.keys();return {exists:keys.some(k=>k.url.startsWith(url(uri).replace(/\/$/,'')+'/')),isDirectory:true,uri,size:0};}
+export async function makeDirectoryAsync(_uri:string,_options?:unknown) {}
+export async function readAsStringAsync(uri:string,options:any={}) {const r=await (await cache()).match(url(uri));if(!r)throw Error('File not found');const blob=(await r.blob()).slice(options.position||0,options.length===undefined?undefined:(options.position||0)+options.length);if(options.encoding==='base64'){const bytes=new Uint8Array(await blob.arrayBuffer());let out='';for(let i=0;i<bytes.length;i+=8192)out+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(out);}return blob.text();}
+export async function writeAsStringAsync(uri:string,data:string,options:any={}) {const body=options.encoding==='base64'?Uint8Array.from(atob(data),c=>c.charCodeAt(0)):data;await (await cache()).put(url(uri),new Response(body,{headers:{'x-modified':String(Date.now()/1000)}}));}
+export async function deleteAsync(uri:string,_options?:unknown) {const c=await cache();for(const k of await c.keys())if(k.url===url(uri)||k.url.startsWith(url(uri).replace(/\/$/,'')+'/'))await c.delete(k);}
+export async function readDirectoryAsync(uri:string) {const prefix=url(uri).replace(/\/$/,'')+'/';return [...new Set((await(await cache()).keys()).filter(k=>k.url.startsWith(prefix)).map(k=>k.url.slice(prefix.length).split('/')[0]))];}
+export async function copyAsync({from,to}:{from:string,to:string}) {const r=await(await cache()).match(url(from)) || (from.startsWith('blob:') || from.startsWith('data:') ? await fetch(from) : undefined);if(!r)throw Error('File not found');await(await cache()).put(url(to),r);}
+export async function moveAsync(args:{from:string,to:string}) {await copyAsync(args);await deleteAsync(args.from);}
+export async function downloadAsync(source:string,dest:string,options:any={}) {const r=await fetch(source,{headers:options.headers,signal:options.signal});if(!r.ok)throw Error(`Download failed (${r.status})`);await(await cache()).put(url(dest),r.clone());return {uri:dest,status:r.status,headers:Object.fromEntries(r.headers.entries())};}
+export function createDownloadResumable(source:string,dest:string,options:any={},progress?:(p:any)=>void) {const controller=new AbortController();return {downloadAsync:async()=>{const result=await downloadAsync(source,dest,{...options,signal:controller.signal});const info=await getInfoAsync(dest);progress?.({totalBytesWritten:info.size,totalBytesExpectedToWrite:info.size});return result;},pauseAsync:async()=>{controller.abort();return {url:source,fileUri:dest,options};},cancelAsync:async()=>controller.abort()};}
+export async function getFreeDiskStorageAsync(){const s=await navigator.storage.estimate();return (s.quota||0)-(s.usage||0)}
+export async function getTotalDiskCapacityAsync(){return (await navigator.storage.estimate()).quota||0}
+export const getContentUriAsync=async(uri:string)=>uri;
+export async function pickFolder(){return new Promise<any>((resolve,reject)=>{const input=document.createElement('input');input.type='file';input.webkitdirectory=true;input.multiple=true;input.oncancel=()=>resolve({granted:false});input.onchange=async()=>{try{const root=documentDirectory+'local/'+crypto.randomUUID()+'/';const c=await cache();for(const file of Array.from(input.files||[])){const path=file.webkitRelativePath||file.name;await c.put(root+path.split('/').map(encodeURIComponent).join('/'),new Response(file,{headers:{'Content-Type':file.type||'application/octet-stream','x-modified':String(file.lastModified/1000)}}));}resolve({granted:true,directoryUri:root});}catch(e){reject(e)}};input.click()})}
+export const StorageAccessFramework={requestDirectoryPermissionsAsync:pickFolder,readDirectoryAsync:async(uri:string)=>(await readDirectoryAsync(uri)).map(n=>uri.replace(/\/$/,'')+'/'+n)};

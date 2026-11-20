@@ -1,0 +1,38 @@
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    # API query strings can contain authentication tokens.
+    access_log off;
+    error_log /dev/stderr crit;
+    add_header Cross-Origin-Opener-Policy same-origin always;
+    add_header Cross-Origin-Embedder-Policy credentialless always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    # Docker's DNS resolver permits backend restarts and starts without a backend.
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    set $music_backend "${MUSIC_SERVER_URL}";
+    location ~ ^/(rest|auth|api)/ {
+        proxy_pass $music_backend$request_uri;
+        proxy_http_version 1.1;
+        proxy_set_header Host $proxy_host;
+        proxy_set_header Connection "";
+        proxy_ssl_server_name on;
+        proxy_ssl_verify on;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        client_max_body_size 20m;
+    }
+
+    location / {
+        expires -1;
+        try_files $uri $uri/ /index.html;
+    }
+}

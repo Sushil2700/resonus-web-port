@@ -1,0 +1,758 @@
+/** Sign in: server type selection + credentials. */
+import Icon from '@/components/Icon';
+import { Image } from 'expo-image';
+import { useState } from 'react';
+import {
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  Switch,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
+import {
+  type OfflineProfile,
+  type Profile,
+  type ServerProfile,
+  useAuthStore,
+} from '@/store/auth';
+import { Dialog } from '@/components/Dialog';
+import { ensureAudioPermission, pickFolder } from '@/lib/localLibrary';
+import { useToast } from '@/store/toast';
+import { useT } from '@/i18n';
+import { LANGUAGES } from '@/i18n/languages';
+import { useSettings } from '@/store/settings';
+import { colors, fontSize, radius, spacing, themed, useTheme, tracking } from '@/theme';
+
+type ServerKey = 'navidrome' | 'opensubsonic' | 'jellyfin' | 'ampache';
+
+const APP_ICON = require('@/assets/images/icon.png');
+
+const SERVERS: {
+  key: ServerKey;
+  name: string;
+  logo: number;
+  sub: string;
+  soon?: boolean;
+}[] = [
+  { key: 'navidrome', name: 'Navidrome', logo: require('@/assets/images/servers/navidrome.png'), sub: 'Subsonic server' },
+  { key: 'opensubsonic', name: 'OpenSubsonic', logo: require('@/assets/images/servers/opensubsonic.png'), sub: 'Subsonic-compatible' },
+  { key: 'jellyfin', name: 'Jellyfin', logo: require('@/assets/images/servers/jellyfin.png'), sub: 'Media server' },
+  { key: 'ampache', name: 'Ampache', logo: require('@/assets/images/servers/ampache.png'), sub: 'Subsonic-compatible' },
+];
+
+function logoFor(type?: string): number {
+  return SERVERS.find((s) => s.key === type)?.logo ?? SERVERS[0].logo;
+}
+
+function isServer(p: Profile): p is ServerProfile {
+  return p._type === 'server';
+}
+
+function isOffline(p: Profile): p is OfflineProfile {
+  return p._type === 'offline';
+}
+
+/** Sorted by their own names, and each shown in its own: the list is read by
+ *  somebody looking for a word they know, not for the English one. */
+const SORTED_LANGUAGES = [...LANGUAGES].sort((a, b) => a.name.localeCompare(b.name));
+const LANGUAGE_NAME = Object.fromEntries(LANGUAGES.map((l) => [l.code, l.name]));
+
+function ProfileRow({ profile, onTap, onRemove }: {
+  profile: Profile;
+  onTap: () => void;
+  onRemove: () => void;
+}) {
+  const t = useT();
+  if (isOffline(profile)) {
+    return (
+      <View style={styles.profileRow}>
+        <Pressable style={styles.profileMain} onPress={onTap}>
+          <View style={styles.offlineIcon}>
+            <Icon name="phone-portrait-outline" size={22} color={colors.accent} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.profileUser} numberOfLines={1}>
+              {t('Local profile')}
+            </Text>
+            <Text style={styles.profileUrl} numberOfLines={1}>
+              {t('Music on your device')}
+            </Text>
+          </View>
+        </Pressable>
+        <Pressable hitSlop={10} onPress={onRemove}>
+          <Icon name="close" size={20} color={colors.textMuted} />
+        </Pressable>
+      </View>
+    );
+  }
+  return (
+    <View style={styles.profileRow}>
+      <Pressable style={styles.profileMain} onPress={onTap}>
+        <Image
+          source={logoFor(profile.serverType)}
+          style={styles.profileLogo}
+          contentFit="contain"
+        />
+        <View style={{ flex: 1 }}>
+          <Text style={styles.profileUser} numberOfLines={1}>
+            {profile.username}
+          </Text>
+          <Text style={styles.profileUrl} numberOfLines={1}>
+            {profile.serverUrl}
+          </Text>
+        </View>
+      </Pressable>
+      <Pressable hitSlop={10} onPress={onRemove}>
+        <Icon name="close" size={20} color={colors.textMuted} />
+      </Pressable>
+    </View>
+  );
+}
+
+const MAX_VISIBLE = 5;
+
+export default function LoginScreen() {
+  // Repaints on a change of appearance or accent: a stack keeps this screen
+  // mounted while you are on another one, out of reach of anything else.
+  useTheme();
+  const login = useAuthStore((s) => s.login);
+  const profiles = useAuthStore((s) => s.profiles);
+  const switchProfile = useAuthStore((s) => s.switchProfile);
+  const removeProfile = useAuthStore((s) => s.removeProfile);
+  const enterOffline = useAuthStore((s) => s.enterOffline);
+  const setOfflineSource = useAuthStore((s) => s.setOfflineSource);
+  const toast = useToast((s) => s.show);
+  const t = useT();
+  const [server, setServer] = useState<ServerKey | 'local'>('navidrome');
+  const [serverUrl, setServerUrl] = useState(Platform.OS === 'web' ? window.location.origin : '');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  // Plain-text auth (`p=enc:`) for proxy/SSO setups that don't validate the
+  // salted hash; off by default (token+salt is standard and secure).
+  const [plainAuth, setPlainAuth] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const [showLanguages, setShowLanguages] = useState(false);
+  const language = useSettings((s) => s.language);
+  const setLanguage = useSettings((s) => s.setLanguage);
+  // Flow for adding profile: home → choose server → credentials.
+  const [step, setStep] = useState<'home' | 'server' | 'form'>('home');
+
+  const isLocal = server === 'local';
+  // Only makes sense for Subsonic servers that use token+salt by default.
+  // Ampache always goes plain-text; Jellyfin has its own session auth.
+  const supportsPlainAuth = server === 'navidrome' || server === 'opensubsonic';
+  // Password not enforced: some servers have accounts without passwords (e.g.
+  // Jellyfin public demo).
+  const canSubmit = serverUrl.trim() && username.trim() && !loading;
+  const visible = profiles.slice(0, MAX_VISIBLE);
+  const overflow = profiles.length > MAX_VISIBLE;
+
+  function goBack() {
+    setError(null);
+    setStep((s) => (s === 'form' ? 'server' : 'home'));
+  }
+  function pickServer(key: ServerKey | 'local') {
+    setServer(key);
+    setError(null);
+    setPlainAuth(false);
+    setShowAdvanced(false);
+    setStep('form');
+  }
+
+  // Offline mode: set source and enter directly (no intermediate screen).
+  async function startLocalDevice() {
+    if (Platform.OS === 'web') return startLocalFolder();
+    const ok = await ensureAudioPermission();
+    if (!ok) {
+      toast(t('We need permission to read your device music.'));
+      return;
+    }
+    await setOfflineSource({ mode: 'device' });
+    await enterOffline();
+  }
+
+  async function startLocalFolder() {
+    const uri = await pickFolder();
+    if (!uri) return;
+    await setOfflineSource({ mode: 'folder', uris: [uri] });
+    await enterOffline();
+  }
+
+  async function onSubmit() {
+    setError(null);
+    setLoading(true);
+    try {
+      await login(serverUrl, username, password, server, supportsPlainAuth && plainAuth);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t("Couldn't sign in"));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onProfileTap(p: Profile) {
+    try {
+      const mode = await switchProfile(p);
+      // Server profile without network: entered its offline mode (downloads).
+      if (mode === 'offline' && isServer(p)) {
+        toast(t('Offline'));
+      }
+    } catch {
+      if (isServer(p)) {
+        toast(t("Couldn't sign in; check the account"));
+      }
+    }
+  }
+
+  // Asked first: the button that does this is a small × beside the one that
+  // signs in, and it now takes the account's downloads with it.
+  const [removing, setRemoving] = useState<Profile | null>(null);
+
+  function onProfileRemove(p: Profile) {
+    setRemoving(p);
+  }
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <ScrollView
+          contentContainerStyle={styles.container}
+          keyboardShouldPersistTaps="handled"
+        >
+          {step === 'home' ? (
+            <>
+              {/* The one setting that has to be reachable from here. Everything
+                  else lives behind a profile, which is fine, but somebody who
+                  cannot read this screen cannot get past it to change the
+                  language of it. In its own native name, so it is legible to
+                  whoever is looking for it. */}
+              <View style={styles.topBar}>
+                <Pressable
+                  style={styles.langBtn}
+                  accessibilityRole="button"
+                  accessibilityLabel={t('Language')}
+                  onPress={() => setShowLanguages(true)}
+                >
+                  <Icon name="globe-outline" size={16} color={colors.textSecondary} />
+                  <Text style={styles.langBtnText}>{LANGUAGE_NAME[language]}</Text>
+                </Pressable>
+              </View>
+              <View style={styles.hero}>
+                <Image source={APP_ICON} style={styles.appIcon} contentFit="cover" />
+                <Text style={styles.logo}>Resonus</Text>
+              </View>
+
+              {profiles.length > 0 ? (
+                <View style={styles.profiles}>
+                  <Text style={styles.groupTitle}>{t('Saved profiles')}</Text>
+                  {visible.map((p, i) => (
+                    <ProfileRow
+                      key={isOffline(p) ? `offline-${i}` : `${p.serverUrl}-${p.username}`}
+                      profile={p}
+                      onTap={() => onProfileTap(p)}
+                      onRemove={() => onProfileRemove(p)}
+                    />
+                  ))}
+                  {overflow ? (
+                    <Pressable style={styles.showMore} onPress={() => setShowAll(true)}>
+                      <Text style={styles.showMoreText}>{t('Show all')}</Text>
+                      {/* The brand green, not the accent: on login the accent
+                          may still be a previous session's. */}
+                      <Icon name="chevron-down" size={18} color={colors.brand} />
+                    </Pressable>
+                  ) : null}
+                </View>
+              ) : null}
+
+              <Pressable style={styles.addAccount} onPress={() => setStep('server')}>
+                <Icon name="add" size={22} color={colors.background} />
+                <Text style={styles.addAccountText}>{t('Add profile')}</Text>
+              </Pressable>
+            </>
+          ) : step === 'server' ? (
+            <>
+              <View style={styles.topBar}>
+                <Pressable
+                  style={styles.backBtn}
+                  onPress={goBack}
+                  hitSlop={12}
+                  accessibilityLabel={t('Back')}
+                >
+                  <Icon name="chevron-back" size={26} color={colors.text} />
+                </Pressable>
+              </View>
+              <Text style={styles.stepTitle}>{t('Add profile')}</Text>
+              <Text style={styles.stepHint}>{t('Choose the server type')}</Text>
+
+              <View style={styles.srvList}>
+                {SERVERS.map((s) => (
+                  <Pressable
+                    key={s.key}
+                    style={[styles.srvRow, s.soon && styles.srvRowDisabled]}
+                    onPress={() =>
+                      s.soon
+                        ? toast(t('{name} is not available yet 🚧', { name: s.name }))
+                        : pickServer(s.key)
+                    }
+                  >
+                    <Image source={s.logo} style={styles.srvLogo} contentFit="contain" />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.srvName}>{s.name}</Text>
+                      <Text style={styles.srvSub}>{t(s.sub)}</Text>
+                    </View>
+                    {s.soon ? null : (
+                      <Icon name="chevron-forward" size={20} color={colors.textMuted} />
+                    )}
+                  </Pressable>
+                ))}
+                <Pressable style={styles.srvRow} onPress={() => pickServer('local')}>
+                  <View style={styles.srvLocalIcon}>
+                    <Icon name="phone-portrait-outline" size={26} color={colors.accent} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    {/* The same name the profile gets once it exists (the row
+                        above, and Settings): "Local" on its own is an adjective
+                        with no noun, which not every language can render. */}
+                    <Text style={styles.srvName}>{t('Local profile')}</Text>
+                    <Text style={styles.srvSub}>{t('Music on your device')}</Text>
+                  </View>
+                  <Icon name="chevron-forward" size={20} color={colors.textMuted} />
+                </Pressable>
+              </View>
+            </>
+          ) : (
+            <>
+              <View style={styles.topBar}>
+                <Pressable
+                  style={styles.backBtn}
+                  onPress={goBack}
+                  hitSlop={12}
+                  accessibilityLabel={t('Back')}
+                >
+                  <Icon name="chevron-back" size={26} color={colors.text} />
+                </Pressable>
+              </View>
+              <View style={styles.serverHero}>
+                {isLocal ? (
+                  <Icon name="phone-portrait-outline" size={44} color={colors.accent} />
+                ) : (
+                  <Image
+                    source={SERVERS.find((s) => s.key === server)?.logo ?? SERVERS[0].logo}
+                    style={styles.serverHeroLogo}
+                    contentFit="contain"
+                  />
+                )}
+              </View>
+
+              {isLocal ? (
+                <View style={styles.form}>
+                  <Text style={styles.localDesc}>
+                    {t('Listen to music stored on your device, without a server. Choose where from:')}
+                  </Text>
+
+                  <Pressable style={styles.localOption} onPress={startLocalFolder}>
+                    <Icon name="folder-outline" size={26} color={colors.accent} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.localOptTitle}>{t('Choose a folder (recommended)')}</Text>
+                      <Text style={styles.localOptSub}>{t('Only the music in the folder you choose.')}</Text>
+                    </View>
+                    <Icon name="chevron-forward" size={20} color={colors.textMuted} />
+                  </Pressable>
+
+                  <Pressable style={styles.localOption} onPress={startLocalDevice}>
+                    <Icon name="phone-portrait-outline" size={26} color={colors.accent} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.localOptTitle}>{t('Scan the whole phone')}</Text>
+                      <Text style={styles.localOptSub}>{t('All the music on your device.')}</Text>
+                    </View>
+                    <Icon name="chevron-forward" size={20} color={colors.textMuted} />
+                  </Pressable>
+                </View>
+              ) : (
+                <View style={styles.form}>
+                  <View style={styles.inputRow}>
+                    <Icon name="globe-outline" size={20} color={colors.textMuted} />
+                    <TextInput
+                      style={styles.inputFlex}
+                       placeholder="https://my-music-server.com"
+                      placeholderTextColor={colors.textMuted}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      keyboardType="url"
+                      value={serverUrl}
+                      onChangeText={setServerUrl}
+                    />
+                  </View>
+                  <View style={styles.inputRow}>
+                    <Icon name="person-outline" size={20} color={colors.textMuted} />
+                    <TextInput
+                      style={styles.inputFlex}
+                      placeholder={t('Username')}
+                      placeholderTextColor={colors.textMuted}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      value={username}
+                      onChangeText={setUsername}
+                    />
+                  </View>
+                  <View style={styles.inputRow}>
+                    <Icon name="lock-closed-outline" size={20} color={colors.textMuted} />
+                    <TextInput
+                      style={styles.inputFlex}
+                      placeholder={t('Password')}
+                      placeholderTextColor={colors.textMuted}
+                      secureTextEntry
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      value={password}
+                      onChangeText={setPassword}
+                    />
+                  </View>
+
+                  {supportsPlainAuth ? (
+                    <View>
+                      <Pressable
+                        style={styles.advancedToggle}
+                        onPress={() => setShowAdvanced((v) => !v)}
+                      >
+                        <Text style={styles.advancedLink}>{t('Advanced')}</Text>
+                        <Icon
+                          name={showAdvanced ? 'chevron-up' : 'chevron-down'}
+                          size={16}
+                          color={colors.textSecondary}
+                        />
+                      </Pressable>
+                      {showAdvanced ? (
+                        <View style={styles.switchRow}>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.switchLabel}>
+                              {t('Plain-text password authentication')}
+                            </Text>
+                            <Text style={styles.switchDesc}>
+                              {t('Sends the password directly instead of a salted token. Only enable it if your server sits behind a reverse proxy or SSO that requires it.')}
+                            </Text>
+                          </View>
+                          <Switch
+                            value={plainAuth}
+                            onValueChange={setPlainAuth}
+                            trackColor={{ false: colors.control, true: colors.accent }}
+                            thumbColor={colors.knob}
+                          />
+                        </View>
+                      ) : null}
+                    </View>
+                  ) : null}
+
+                  {error ? <Text style={styles.error}>{error}</Text> : null}
+
+                  <Pressable
+                    style={[
+                      styles.button,
+                      { backgroundColor: colors.accent },
+                      !canSubmit && styles.buttonDisabled,
+                    ]}
+                    disabled={!canSubmit}
+                    onPress={onSubmit}
+                  >
+                    {loading ? (
+                      <ActivityIndicator color={colors.onAccent} />
+                    ) : (
+                      <Text style={styles.buttonText}>{t('Sign in')}</Text>
+                    )}
+                  </Pressable>
+                </View>
+              )}
+            </>
+          )}
+        </ScrollView>
+      </KeyboardAvoidingView>
+
+      <Modal
+        visible={showAll}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setShowAll(false)}
+      >
+        <SafeAreaView style={styles.modalSafe} edges={['top']}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>{t('Saved profiles')}</Text>
+            <Pressable hitSlop={12} onPress={() => setShowAll(false)}>
+              <Text style={styles.modalDone}>{t('Close')}</Text>
+            </Pressable>
+          </View>
+          <ScrollView contentContainerStyle={styles.modalList}>
+            {profiles.map((p, i) => (
+              <ProfileRow
+                key={isOffline(p) ? `all-offline-${i}` : `all-${p.serverUrl}-${p.username}`}
+                profile={p}
+                onTap={() => {
+                  setShowAll(false);
+                  void onProfileTap(p);
+                }}
+                onRemove={() => onProfileRemove(p)}
+              />
+            ))}
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
+      <Modal
+        visible={showLanguages}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setShowLanguages(false)}
+      >
+        <SafeAreaView style={styles.modalSafe} edges={['top']}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>{t('Language')}</Text>
+            <Pressable hitSlop={12} onPress={() => setShowLanguages(false)}>
+              <Text style={styles.modalDone}>{t('Close')}</Text>
+            </Pressable>
+          </View>
+          <ScrollView contentContainerStyle={styles.modalList}>
+            {SORTED_LANGUAGES.map((l) => (
+              <Pressable
+                key={l.code}
+                style={styles.langRow}
+                accessibilityRole="radio"
+                accessibilityState={{ checked: l.code === language }}
+                onPress={() => {
+                  setLanguage(l.code);
+                  setShowLanguages(false);
+                }}
+              >
+                <Text style={styles.langRowText}>{l.name}</Text>
+                {l.code === language ? (
+                  // The brand green, like the chevron above: the accent here
+                  // may still be a profile's that is not open yet.
+                  <Icon name="checkmark" size={20} color={colors.brand} />
+                ) : null}
+              </Pressable>
+            ))}
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
+      <Dialog
+        visible={!!removing}
+        title={t('Remove profile?')}
+        // The local profile owns no downloads: it points at music that was
+        // already on the phone and stays there.
+        message={
+          removing && !isOffline(removing)
+            ? t('Its downloads and its offline copy of the library will be deleted from this device.')
+            : t('The music on your device is not touched.')
+        }
+        confirmLabel={t('Remove')}
+        destructive
+        onCancel={() => setRemoving(null)}
+        onConfirm={() => {
+          const p = removing;
+          setRemoving(null);
+          if (p) void removeProfile(p);
+        }}
+      />
+    </SafeAreaView>
+  );
+}
+
+const styles = themed((colors) => ({
+  safe: { flex: 1, backgroundColor: colors.background },
+  container: { ...(Platform.OS === 'web' ? { maxWidth: 520, width: '100%', alignSelf: 'center' } as const : {}), flexGrow: 1, padding: spacing.xl, paddingTop: spacing.xxl },
+  logo: {
+    // The brand green: on login the accent may be a previous session's.
+    color: colors.brand,
+    fontSize: fontSize.xxl,
+    letterSpacing: tracking.display,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  profiles: { gap: spacing.sm, marginBottom: spacing.lg },
+  groupTitle: {
+    color: colors.textSecondary,
+    fontSize: fontSize.sm,
+    fontWeight: '500',
+    marginTop: spacing.sm,
+  },
+  profileRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    padding: spacing.md,
+  },
+  profileMain: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+  },
+  profileLogo: { width: 36, height: 36 },
+  profileUser: { color: colors.text, fontSize: fontSize.md, fontWeight: '500' },
+  profileUrl: { color: colors.textMuted, fontSize: fontSize.xs },
+  offlineIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: radius.pill,
+    backgroundColor: colors.surfaceHighlight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  showMore: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.xs,
+    paddingVertical: spacing.sm,
+  },
+  showMoreText: { color: colors.brand, fontSize: fontSize.sm, fontWeight: '500' },
+  addAccount: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    paddingVertical: spacing.md,
+    marginTop: spacing.md,
+    borderRadius: radius.pill,
+    backgroundColor: colors.brand,
+  },
+  addAccountText: { color: colors.onAccent, fontSize: fontSize.md, fontWeight: '600' },
+  hero: { alignItems: 'center', marginBottom: spacing.xl },
+  appIcon: { width: 88, height: 88, borderRadius: 22, marginBottom: spacing.md },
+  topBar: { height: 32, justifyContent: 'center', marginBottom: spacing.md },
+  langBtn: {
+    alignSelf: 'flex-end',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    borderRadius: radius.pill,
+    backgroundColor: colors.surface,
+  },
+  langBtnText: { color: colors.textSecondary, fontSize: fontSize.sm, fontWeight: '600' },
+  langRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.md,
+    backgroundColor: colors.surface,
+  },
+  langRowText: { color: colors.text, fontSize: fontSize.md, fontWeight: '500' },
+  backBtn: { alignSelf: 'flex-start' },
+  stepTitle: {
+    color: colors.text,
+    fontSize: fontSize.xl,
+    letterSpacing: tracking.title,
+    fontWeight: '500',
+    textAlign: 'center',
+    marginBottom: spacing.xs,
+  },
+  stepHint: {
+    color: colors.textSecondary,
+    fontSize: fontSize.sm,
+    textAlign: 'center',
+    marginBottom: spacing.lg,
+  },
+  srvList: { gap: spacing.sm },
+  srvRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    padding: spacing.lg,
+  },
+  srvRowDisabled: { opacity: 0.5 },
+  srvLogo: { width: 40, height: 40 },
+  srvLocalIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: radius.pill,
+    backgroundColor: colors.surfaceHighlight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  srvName: { color: colors.text, fontSize: fontSize.md, fontWeight: '500' },
+  srvSub: { color: colors.textSecondary, fontSize: fontSize.xs, marginTop: 2 },
+  serverHero: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 72,
+    marginBottom: spacing.lg,
+  },
+  serverHeroLogo: { width: 64, height: 64 },
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.surfaceHighlight,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.lg,
+  },
+  inputFlex: { flex: 1, color: colors.text, paddingVertical: spacing.md, fontSize: fontSize.md },
+  localDesc: { color: colors.textSecondary, fontSize: fontSize.sm, marginBottom: spacing.xs },
+  localOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    padding: spacing.lg,
+  },
+  localOptTitle: { color: colors.text, fontSize: fontSize.md, fontWeight: '500' },
+  localOptSub: { color: colors.textSecondary, fontSize: fontSize.xs, marginTop: 2 },
+  form: { gap: spacing.md },
+  advancedToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    alignSelf: 'flex-start',
+    paddingVertical: spacing.xs,
+  },
+  advancedLink: { color: colors.textSecondary, fontSize: fontSize.sm, fontWeight: '500' },
+  switchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    marginTop: spacing.sm,
+  },
+  switchLabel: { color: colors.text, fontSize: fontSize.sm, fontWeight: '500' },
+  switchDesc: { color: colors.textMuted, fontSize: fontSize.xs, marginTop: 2 },
+  error: { color: colors.danger, fontSize: fontSize.sm },
+  button: {
+    borderRadius: radius.pill,
+    paddingVertical: spacing.md,
+    alignItems: 'center',
+    marginTop: spacing.sm,
+  },
+  buttonDisabled: { opacity: 0.5 },
+  buttonText: { color: colors.onAccent, fontSize: fontSize.md, fontWeight: '600' },
+  modalSafe: { flex: 1, backgroundColor: colors.background },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+  },
+  modalTitle: { color: colors.text, fontSize: fontSize.lg, letterSpacing: tracking.heading, fontWeight: '500' },
+  modalDone: { color: colors.accent, fontSize: fontSize.md, fontWeight: '600' },
+  modalList: { paddingHorizontal: spacing.xl, gap: spacing.sm, paddingBottom: spacing.xl },
+}));

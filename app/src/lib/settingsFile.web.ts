@@ -1,0 +1,5 @@
+import * as DocumentPicker from 'expo-document-picker';
+import Constants from 'expo-constants';
+import { exportedSettings } from '@/store/settings';
+export async function shareSettingsFile(){const body={app:'resonus-settings',format:1,version:Constants.expoConfig?.version,exportedAt:new Date().toISOString(),settings:exportedSettings()};const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(body,null,2)],{type:'application/json'}));a.download='resonus-settings.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);return true;}
+export async function pickSettingsFile(){const r=await DocumentPicker.getDocumentAsync({type:'*/*',multiple:false});if(r.canceled||!r.assets?.[0])return null;const data=await(await fetch(r.assets[0].uri)).json();if(data.app!=='resonus-settings'||data.format!==1||!data.settings||typeof data.settings!=='object'||Array.isArray(data.settings))throw Error('Not a Resonus settings file');return data.settings as Record<string,unknown>;}

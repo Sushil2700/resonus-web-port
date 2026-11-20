@@ -1,0 +1,5 @@
+# For Caddy running on the same host (outside Docker).
+# Point this domain's DNS to your server and allow ports 80 and 443.
+music.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
