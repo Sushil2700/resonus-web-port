@@ -7,9 +7,18 @@ container serves the player and proxies requests to an existing server.
 
 ## Quick start
 
-Requires Docker Engine with the Compose plugin and an existing Navidrome or
-OpenSubsonic server. Download/clone this repository, then in its root:
+---
+You can use music.app.sushil.co.uk, and setup with your own login details.
+---
 
+Requires Docker Engine with the Compose plugin and an existing Navidrome or
+OpenSubsonic server. Download/clone this repository, and run the docker compose:
+
+Clone and navigate
+```sh
+git clone https://github.com/Sushil2700/resonus-web-port.git
+cd resonus-web-port
+```
 ```sh
 cp .env.example .env
 # Edit .env: set MUSIC_SERVER_URL to your music server's address.
