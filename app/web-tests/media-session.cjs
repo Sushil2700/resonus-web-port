@@ -9,6 +9,7 @@ const assert = require('node:assert/strict');
   });
   try {
     const page = await browser.newPage();
+    page.setDefaultTimeout(15000);
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
@@ -42,7 +43,13 @@ const assert = require('node:assert/strict');
     await page.route('https://test.invalid/**', async route => {
       const endpoint = new URL(route.request().url()).pathname.split('/').pop().replace('.view', '');
       if (endpoint === 'stream' || endpoint === 'download') {
-        return route.fulfill({ contentType: 'audio/wav', body: wav });
+        const range = /bytes=(\d+)-(\d*)/.exec(route.request().headers().range || '');
+        const start = range ? Number(range[1]) : 0;
+        const end = range?.[2] ? Math.min(Number(range[2]), wav.length - 1) : wav.length - 1;
+        return route.fulfill({
+          status: range ? 206 : 200, contentType: 'audio/wav', body: wav.subarray(start, end + 1),
+          headers: { 'accept-ranges': 'bytes', ...(range ? { 'content-range': `bytes ${start}-${end}/${wav.length}` } : {}) },
+        });
       }
       await route.fulfill({ json: { 'subsonic-response': {
         status: 'ok', version: '1.16.1', type: 'subsonic', openSubsonic: true,
@@ -99,8 +106,8 @@ const assert = require('node:assert/strict');
     await page.waitForFunction(() => navigator.mediaSession.playbackState === 'playing');
     // Clearing playback must also remove every native action and metadata.
     await page.locator('.desktop-track').click();
-    const pause = page.getByRole('button', { name: 'Pause', exact: true });
-    await pause.last().hover();
+    const pause = page.locator('[role="button"][aria-label="Pause"]');
+    await pause.hover();
     await page.mouse.down();
     await page.waitForTimeout(800);
     await page.mouse.up();

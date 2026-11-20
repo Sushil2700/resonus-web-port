@@ -97,6 +97,20 @@ Native features such as Android Auto, widgets, casting and the Android equalizer
 are unavailable. Browser codec support, storage quotas and background playback
 limits vary by browser; native gapless playback is not guaranteed.
 
+## System media controls
+
+Quick settings, lock-screen controls and media keys can control play/pause and
+previous/next tracks through the browser's Media Session API. Skipping follows
+the same queue and previous-track restart preference as the in-app buttons.
+Track metadata and seeking are also supported. The controls shown depend on
+the browser and operating system; reload the app after updating.
+
+The web audio patch in `app/scripts/apply-web-patches.cjs` connects track-skip
+actions to the existing queue handlers in both expo-audio's source and compiled
+web entry. The browser regression test checks next/previous, restart, seeking,
+pause/resume and clearing the session when stopped using synthetic audio.
+It does not inspect a physical phone's quick-settings panel.
+
 ## Development and validation
 
 ```sh
@@ -110,6 +124,7 @@ npx playwright install chromium
 # With the container running at localhost:8080:
 node web-tests/smoke.cjs
 node web-tests/sharing.cjs
+node web-tests/media-session.cjs
 ```
 
 Local npm installation needs Node 24 and `patch`. Browser tests accept
